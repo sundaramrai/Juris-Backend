@@ -84,15 +84,15 @@ async function generateGeminiResponse(prompt) {
     console.error("❌ Error generating Gemini response:", error);
     // Check if error message indicates recitation block.
     if (error.message && error.message.includes("RECITATION")) {
-      // Append an instruction to avoid recitation.
-      const fallbackPrompt = prompt + "\nNote: Please provide an original analysis without reciting any pre-existing legal texts or copyrighted material.";
+      // Append a stronger instruction to avoid any recitation.
+      const fallbackPrompt = prompt + "\nPlease generate an entirely original response. Do not include any verbatim recitations of legal texts or copyrighted material. Provide your analysis entirely in your own words.";
       try {
         const resultFallback = await model.generateContent(fallbackPrompt);
         const responseFallback = await resultFallback.response;
         return responseFallback.text();
       } catch (fallbackError) {
         console.error("❌ Fallback Error generating Gemini response:", fallbackError);
-        return "I'm sorry, I encountered an error processing your request.";
+        return "I'm sorry, I'm unable to generate a response due to restrictions on reciting pre-existing legal texts.";
       }
     }
     return "I'm sorry, I encountered an error processing your request.";
