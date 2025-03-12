@@ -8,7 +8,7 @@ require("dotenv").config();
 
 const app = express();
 const corsOptions = {
-  origin: ["http://localhost:4200", "https://juris-legal-ai.vercel.app"],
+  origin : "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
