@@ -4,11 +4,12 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
 const mongoose = require("mongoose");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const app = express();
 const corsOptions = {
-  origin : "*",
+  origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
@@ -22,6 +23,12 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+const algorithm = 'aes-256-gcm';
+const IV_LENGTH = 16; // For AES, this is always 16 bytes.
+
+// Ensure your ENCRYPTION_KEY environment variable is a 64-character hex string (256 bits).
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // e.g., "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 mongoose
   .connect(MONGO_URI, {
@@ -75,40 +82,108 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+function encryptText(text) {
+  // Ensure text is a string; if not, default to an empty string.
+  if (typeof text !== 'string') {
+    text = text ? text.toString() : "";
+  }
+  // Check if the encryption key is defined.
+  if (!ENCRYPTION_KEY) {
+    throw new Error("ENCRYPTION_KEY environment variable is not defined");
+  }
+  // Convert the ENCRYPTION_KEY from hex to a Buffer.
+  const keyBuffer = Buffer.from(ENCRYPTION_KEY, 'hex');
+  // Verify that the key is exactly 32 bytes (256 bits).
+  if (keyBuffer.length !== 32) {
+    throw new Error("Invalid ENCRYPTION_KEY length. It must be a 64-character hex string representing 32 bytes.");
+  }
+  // Generate a random IV.
+  const iv = crypto.randomBytes(IV_LENGTH);
+  const cipher = crypto.createCipheriv(algorithm, keyBuffer, iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  const authTag = cipher.getAuthTag().toString('hex');
+  // Return the encrypted string in the format IV:encrypted:authTag.
+  return iv.toString('hex') + ':' + encrypted + ':' + authTag;
+}
+
+function decryptText(encryptedText) {
+  const parts = encryptedText.split(':');
+  if (parts.length !== 3) {
+    throw new Error("Invalid encrypted text format");
+  }
+  const iv = Buffer.from(parts[0], 'hex');
+  const encrypted = parts[1];
+  const authTag = Buffer.from(parts[2], 'hex');
+  const decipher = crypto.createDecipheriv(algorithm, Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+  decipher.setAuthTag(authTag);
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+
 async function generateGeminiResponse(prompt) {
-  try {
-    const result = await model.generateContent(prompt);
+  // Helper function to attempt generating a response with a given prompt.
+  const attemptResponse = async (modPrompt) => {
+    const result = await model.generateContent(modPrompt);
     const response = await result.response;
     return response.text();
-  } catch (error) {
-    console.error("❌ Error generating Gemini response:", error);
-    // Check if error message indicates recitation block.
-    if (error.message && error.message.includes("RECITATION")) {
-      // Append a stronger instruction to avoid any recitation.
-      const fallbackPrompt = prompt + "\nPlease generate an entirely original response. Do not include any verbatim recitations of legal texts or copyrighted material. Provide your analysis entirely in your own words.";
-      try {
-        const resultFallback = await model.generateContent(fallbackPrompt);
-        const responseFallback = await resultFallback.response;
-        return responseFallback.text();
-      } catch (fallbackError) {
-        console.error("❌ Fallback Error generating Gemini response:", fallbackError);
-        return "I'm sorry, I'm unable to generate a response due to restrictions on reciting pre-existing legal texts.";
+  };
+
+  // Define a series of prompts with progressively stricter instructions to avoid recitation.
+  const promptAttempts = [
+    prompt,
+    prompt + "\n\nIMPORTANT: Generate a completely original analysis. Do not quote or recite any legal texts or excerpts. Provide a precise, synthesized explanation entirely in your own words.",
+    prompt + "\n\nIMPORTANT: DO NOT include any verbatim legal text. Synthesize a fully original and accurate explanation by summarizing the legal principles in your own words without reciting any existing legal material."
+  ];
+
+  // Try each prompt in sequence.
+  for (let i = 0; i < promptAttempts.length; i++) {
+    try {
+      const responseText = await attemptResponse(promptAttempts[i]);
+      return responseText;
+    } catch (error) {
+      console.error(`❌ Error in attempt ${i + 1}:`, error);
+      // If error message is due to RECITATION, try the next fallback prompt.
+      if (!(error.message && error.message.includes("RECITATION"))) {
+        // For any other error, return a generic error message.
+        return "I'm sorry, I encountered an error processing your request.";
       }
+      // Otherwise, continue to next attempt.
     }
-    return "I'm sorry, I encountered an error processing your request.";
   }
+
+  // If all attempts result in a recitation error, return a safe fallback message.
+  return "I'm sorry, I'm unable to generate a response due to restrictions on reciting pre-existing legal texts.";
 }
 
 async function generateChatSummary(messages) {
+  // Construct a clear, structured conversation text.
   const chatText = messages
-    .map((msg) => `${msg.type === "user" ? "User" : "Bot"}: ${msg.text}`)
+    .map((msg) => `${msg.type === "user" ? "User:" : "Bot:"} ${msg.text}`)
     .join("\n");
-  const prompt = `Provide a very short summary of the following chat conversation in exactly 5-6 words (no more than 6 words):\n${chatText}`;
+
+  // Revised prompt instructing exactly 6 essential words.
+  const prompt = `Write a concise, highly accurate summary of the following chat conversation in exactly 6 words. Each word must be essential and there should be no extra text or punctuation beyond the six words.
+
+Chat Conversation:
+${chatText}`;
+
   try {
     let summary = await generateGeminiResponse(prompt);
-    const words = summary.trim().split(/\s+/);
+    summary = summary.trim();
+
+    // Clean up potential punctuation or extra spacing.
+    summary = summary.replace(/[^a-zA-Z0-9\s]/g, "").replace(/\s+/g, " ");
+
+    // Enforce exactly 6 words.
+    const words = summary.split(" ");
     if (words.length > 6) {
       summary = words.slice(0, 6).join(" ");
+    } else if (words.length < 6) {
+      // Optionally, if less than 6 words are generated, we return as-is,
+      // or you could choose to append a note if desired.
+      summary = summary;
     }
     return summary;
   } catch (error) {
@@ -123,7 +198,19 @@ function isLegalQuery(query) {
     "law", "legal", "act", "section", "court", "constitution",
     "rights", "criminal", "civil", "contract", "divorce", "property",
     "injunction", "notice", "case", "litigation", "dispute", "judicial",
-    "article", "accident", "injury", "traffic"
+    "article", "accident", "injury", "traffic", "offence", "arrest",
+    "bail", "sentence", "appeal", "petition", "writ", "hearing",
+    "tribunal", "authority", "jurisdiction", "complaint", "plaintiff",
+    "defendant", , "litigants", "litigant", "legal", "lawyer", "advocate",
+    "attorney", "counsel", "solicitor", "barrister", "judge", "justice",
+    "court", "case", "trial", "appeal", "writ", "petition", "order",
+    "judgment", "decree", "injunction", "hearing", "argument", "plea",
+    "evidence", "proof", "document", "affidavit", "oath", "affirmation",
+    "perjury", "witness", "deposition", "examination", "cross-examination",
+    "testimony", "verdict", "sentence", "appeal", "petition", "complaint",
+    "plaint", "evidence", "witness", "deposition", "affidavit",
+    "oath", "affirmation", "perjury", "testimony", "examination",
+    "deposition", "witness", "deposition", "evidence", "witness",
   ];
   const q = query.toLowerCase();
   return legalKeywords.some(keyword => new RegExp(`\\b${keyword}\\b`).test(q));
@@ -181,75 +268,85 @@ app.post("/api/chat", authenticateToken, async (req, res) => {
   try {
     const { message } = req.body;
     const userId = req.user.userId;
+
     if (!message) {
       return res.status(400).json({ message: "Message is required" });
     }
-    // Determine if query is legally related.
+
+    // Determine if the query is legally related.
     const legalFlag = isLegalQuery(message);
-    let prompt;
+
+    // Handle non-legal queries gracefully.
     if (!legalFlag) {
-      // Even if the query is only slightly related, we attempt to provide a legal perspective.
-      prompt = `
-You are Juris, an AI Legal Assistance Chatbot for Indian Citizens. Although the query does not appear strictly legal-related, please provide a response from a legal perspective using Indian law. Use the following structured format:
+      return res.json({
+        userMessage: message,
+        botResponse: "**This query does not appear to be related to legal matters. Please ask questions related to legal queries for accurate guidance.**",
+        chatSummary: "Non-legal query detected."
+      });
+    }
 
-Title: [Short Title Reflecting the Query]
+    // Structured Prompt for Legal Queries.
+    const prompt = `
+You are Juris, an AI Legal Assistance Chatbot for Indian Citizens. You answer legal queries using Indian law with exceptional accuracy by leveraging advanced language models (similar to those used by Gemini, Claude, or OpenAI). Please provide your response in the following structured format:
 
-Summary:
-  - A brief overview of the legal issue.
-
-Relevant Legal Provisions:
-  - List the specific acts, sections, or legal precedents relevant to the query.
-
-Analysis:
-  - Detailed explanation of how the law applies to the query.
-
-Conclusion:
-  - Summarize the main points and provide a clear answer.
-
-Disclaimer:
-  - "Disclaimer: I am an AI legal assistance tool and my responses are for informational purposes only. They do not constitute legal advice. For personalized legal advice, please consult a qualified legal professional."
+1. **Title:** [A short title reflecting the query]
+2. **Summary:** A brief overview of the legal issue.
+3. **Relevant Legal Provisions:** List the specific acts, sections, or legal precedents relevant to the query.
+4. **Analysis:** A detailed explanation of how the law applies to the query.
+5. **Real life incidents:** Provide examples of real-life incidents related to this query in India.
+6. **Conclusion:** Summarize the main points and provide a clear answer.
+7. **References:** Cite any relevant sources or legal references.
 
 Query: ${message}
 
 Please provide your answer.
-      `;
-    } else {
-      prompt = `
-You are Juris, an AI Legal Assistance Chatbot for Indian Citizens. You answer legal queries using Indian law. Please provide your response in the following structured format:
+    `;
 
-Title: [Short Title Reflecting the Query]
+    // Generate bot response.
+    let botResponseRaw = await generateGeminiResponse(prompt);
+    // Fallback to a default response if the generated response is undefined.
+    const botResponse = botResponseRaw ? botResponseRaw : "I'm sorry, I encountered an error generating a response.";
 
-Summary:
-  - A brief overview of the legal issue.
-
-Relevant Legal Provisions:
-  - List the specific acts, sections, or legal precedents relevant to the query.
-
-Analysis:
-  - Detailed explanation of how the law applies to the query.
-
-Conclusion:
-  - Summarize the main points and provide a clear answer.
-
-Disclaimer:
-  - "Disclaimer: I am an AI legal assistance tool and my responses are for informational purposes only. They do not constitute legal advice. For personalized legal advice, please consult a qualified legal professional."
-
-Query: ${message}
-
-Please provide your answer.
-      `;
-    }
-    const botResponse = await generateGeminiResponse(prompt);
-    let chat = await Chat.findOne({ userId });
-    if (!chat) {
-      chat = new Chat({ userId, messages: [] });
-    }
     const currentTime = new Date();
-    chat.messages.push({ type: "user", text: message, time: currentTime });
-    chat.messages.push({ type: "bot", text: botResponse, time: currentTime });
-    chat.chatSummary = await generateChatSummary(chat.messages);
+
+    // Create plain text objects for summary generation.
+    const userMessagePlain = { type: "user", text: message, time: currentTime };
+    const botMessagePlain = { type: "bot", text: botResponse, time: currentTime };
+
+    // Retrieve or create chat history.
+    let chat = await Chat.findOne({ userId });
+    let plainMessagesForSummary = [];
+    if (chat) {
+      // Decode all existing messages for summary generation.
+      plainMessagesForSummary = chat.messages.map(m => ({
+        type: m.type,
+        text: decryptText(m.text),
+        time: m.time
+      }));
+      // Append new messages.
+      plainMessagesForSummary.push(userMessagePlain, botMessagePlain);
+      // Save new messages encoded.
+      chat.messages.push({ type: "user", text: encryptText(message), time: currentTime });
+      chat.messages.push({ type: "bot", text: encryptText(botResponse), time: currentTime });
+    } else {
+      plainMessagesForSummary = [userMessagePlain, botMessagePlain];
+      chat = new Chat({
+        userId,
+        messages: [
+          { type: "user", text: encryptText(message), time: currentTime },
+          { type: "bot", text: encryptText(botResponse), time: currentTime }
+        ]
+      });
+    }
+
+    // Generate a chat summary using the decoded messages.
+    const summaryPlain = await generateChatSummary(plainMessagesForSummary);
+    // Store the summary encoded.
+    chat.chatSummary = encryptText(summaryPlain);
     await chat.save();
-    res.json({ userMessage: message, botResponse, chatSummary: chat.chatSummary });
+
+    // Send back the plain text messages and summary.
+    res.json({ userMessage: message, botResponse, chatSummary: summaryPlain });
   } catch (error) {
     console.error("❌ Error processing chat:", error);
     res.status(500).json({ message: "Error processing chat" });
@@ -286,10 +383,14 @@ app.get("/api/chat/history", authenticateToken, async (req, res) => {
     if (!chat) {
       return res.json({ messages: [], chatSummary: "" });
     }
-    res.json({ 
-      messages: chat.messages, 
-      chatSummary: chat.chatSummary || "",
-    });
+    // Decode each stored message.
+    const decodedMessages = chat.messages.map(m => ({
+      ...m.toObject(),
+      text: decryptText(m.text)
+    }));
+    // Decode the chat summary.
+    const decodedSummary = chat.chatSummary ? decryptText(chat.chatSummary) : "";
+    res.json({ messages: decodedMessages, chatSummary: decodedSummary });
   } catch (error) {
     console.error("❌ Error fetching chat history:", error);
     res.status(500).json({ message: "Error fetching chat history" });
