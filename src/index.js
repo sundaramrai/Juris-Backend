@@ -32,8 +32,6 @@ const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // e.g., "0123456789abcdef012
 
 mongoose
   .connect(MONGO_URI, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
     serverSelectionTimeoutMS: 10000,
   })
   .then(() => console.log("✅ MongoDB Connected Successfully"))
@@ -408,5 +406,4 @@ app.delete("/api/chat/history", authenticateToken, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`✅ API Endpoints available at http://localhost:${PORT}/api`);
 });
