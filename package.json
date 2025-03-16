@@ -4,10 +4,22 @@
   "main": "index.js",
   "scripts": {
     "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
     "build": "npm install",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": [
+    "Juris",
+    "AI",
+    "legal",
+    "ai",
+    "chatbot",
+    "express",
+    "mongodb",
+    "mongoose",
+    "jwt",
+    "bcrypt"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
