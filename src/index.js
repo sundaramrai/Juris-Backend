@@ -218,10 +218,7 @@ function isLegalQuery(query) {
 
 app.post("/api/register", async (req, res) => {
   try {
-    const { email, username, password, confirmPassword } = req.body;
-    if (password !== confirmPassword) {
-      return res.status(400).json({ message: "Passwords do not match" });
-    }
+    const { email, username, password } = req.body;
     const existingUser = await User.findOne({ $or: [{ email }, { username }] });
     if (existingUser) {
       return res.status(400).json({
