@@ -7,6 +7,20 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const crypto = require("crypto");
 require("dotenv").config();
 
+// Validate required environment variables
+const requiredEnvVars = [
+  "MONGO_URI",
+  "JWT_SECRET",
+  "GEMINI_API_KEY",
+  "ENCRYPTION_KEY",
+  "USERNAME_HASH_SALT"
+];
+const missingVars = requiredEnvVars.filter(key => !process.env[key]);
+if (missingVars.length > 0) {
+  console.error("Missing environment variables:", missingVars.join(', '));
+  process.exit(1);
+}
+
 const app = express();
 const corsOptions = {
   origin: "*",
@@ -20,15 +34,14 @@ app.use(express.json());
 const MONGO_URI = process.env.MONGO_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // Must be a 64-character hex string (32 bytes)
+const USERNAME_HASH_SALT = process.env.USERNAME_HASH_SALT; // Deterministic salt for username hashing
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-const algorithm = 'aes-256-gcm';
+const algorithm = "aes-256-gcm";
 const IV_LENGTH = 16; // For AES, this is always 16 bytes.
-
-// Ensure your ENCRYPTION_KEY environment variable is a 64-character hex string (256 bits).
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // e.g., "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 mongoose
   .connect(MONGO_URI, {
@@ -43,6 +56,7 @@ mongoose
 const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   username: { type: String, required: true, unique: true },
+  usernameHash: { type: String, required: true, unique: true },
   password: { type: String, required: true },
 });
 const User = mongoose.model("User", userSchema);
@@ -85,23 +99,18 @@ function encryptText(text) {
   if (typeof text !== 'string') {
     text = text ? text.toString() : "";
   }
-  // Check if the encryption key is defined.
   if (!ENCRYPTION_KEY) {
     throw new Error("ENCRYPTION_KEY environment variable is not defined");
   }
-  // Convert the ENCRYPTION_KEY from hex to a Buffer.
   const keyBuffer = Buffer.from(ENCRYPTION_KEY, 'hex');
-  // Verify that the key is exactly 32 bytes (256 bits).
   if (keyBuffer.length !== 32) {
     throw new Error("Invalid ENCRYPTION_KEY length. It must be a 64-character hex string representing 32 bytes.");
   }
-  // Generate a random IV.
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv(algorithm, keyBuffer, iv);
   let encrypted = cipher.update(text, 'utf8', 'hex');
   encrypted += cipher.final('hex');
   const authTag = cipher.getAuthTag().toString('hex');
-  // Return the encrypted string in the format IV:encrypted:authTag.
   return iv.toString('hex') + ':' + encrypted + ':' + authTag;
 }
 
@@ -120,48 +129,46 @@ function decryptText(encryptedText) {
   return decrypted;
 }
 
+// Deterministic hashing for username using HMAC-SHA256 with a constant salt.
+function hashUsername(username) {
+  return crypto
+    .createHmac("sha256", USERNAME_HASH_SALT)
+    .update(username.toLowerCase().trim())
+    .digest("hex");
+}
+
 async function generateGeminiResponse(prompt) {
-  // Helper function to attempt generating a response with a given prompt.
   const attemptResponse = async (modPrompt) => {
     const result = await model.generateContent(modPrompt);
     const response = await result.response;
     return response.text();
   };
 
-  // Define a series of prompts with progressively stricter instructions to avoid recitation.
   const promptAttempts = [
     prompt,
     prompt + "\n\nIMPORTANT: Generate a completely original analysis. Do not quote or recite any legal texts or excerpts. Provide a precise, synthesized explanation entirely in your own words.",
     prompt + "\n\nIMPORTANT: DO NOT include any verbatim legal text. Synthesize a fully original and accurate explanation by summarizing the legal principles in your own words without reciting any existing legal material."
   ];
 
-  // Try each prompt in sequence.
   for (let i = 0; i < promptAttempts.length; i++) {
     try {
       const responseText = await attemptResponse(promptAttempts[i]);
       return responseText;
     } catch (error) {
       console.error(`❌ Error in attempt ${i + 1}:`, error);
-      // If error message is due to RECITATION, try the next fallback prompt.
       if (!(error.message && error.message.includes("RECITATION"))) {
-        // For any other error, return a generic error message.
         return "I'm sorry, I encountered an error processing your request.";
       }
-      // Otherwise, continue to next attempt.
     }
   }
-
-  // If all attempts result in a recitation error, return a safe fallback message.
   return "I'm sorry, I'm unable to generate a response due to restrictions on reciting pre-existing legal texts.";
 }
 
 async function generateChatSummary(messages) {
-  // Construct a clear, structured conversation text.
   const chatText = messages
     .map((msg) => `${msg.type === "user" ? "User:" : "Bot:"} ${msg.text}`)
     .join("\n");
 
-  // Revised prompt instructing exactly 6 essential words.
   const prompt = `Write a concise, highly accurate summary of the following chat conversation in exactly 6 words. Each word must be essential and there should be no extra text or punctuation beyond the six words.
 
 Chat Conversation:
@@ -170,18 +177,10 @@ ${chatText}`;
   try {
     let summary = await generateGeminiResponse(prompt);
     summary = summary.trim();
-
-    // Clean up potential punctuation or extra spacing.
     summary = summary.replace(/[^a-zA-Z0-9\s]/g, "").replace(/\s+/g, " ");
-
-    // Enforce exactly 6 words.
     const words = summary.split(" ");
     if (words.length > 6) {
       summary = words.slice(0, 6).join(" ");
-    } else if (words.length < 6) {
-      // Optionally, if less than 6 words are generated, we return as-is,
-      // or you could choose to append a note if desired.
-      summary = summary;
     }
     return summary;
   } catch (error) {
@@ -190,7 +189,6 @@ ${chatText}`;
   }
 }
 
-// Updated isLegalQuery using regex word boundaries for better matching.
 function isLegalQuery(query) {
   const legalKeywords = [
     "law", "legal", "act", "section", "court", "constitution",
@@ -199,16 +197,12 @@ function isLegalQuery(query) {
     "article", "accident", "injury", "traffic", "offence", "arrest",
     "bail", "sentence", "appeal", "petition", "writ", "hearing",
     "tribunal", "authority", "jurisdiction", "complaint", "plaintiff",
-    "defendant", , "litigants", "litigant", "legal", "lawyer", "advocate",
+    "defendant", "litigants", "litigant", "legal", "lawyer", "advocate",
     "attorney", "counsel", "solicitor", "barrister", "judge", "justice",
-    "court", "case", "trial", "appeal", "writ", "petition", "order",
-    "judgment", "decree", "injunction", "hearing", "argument", "plea",
+    "trial", "order", "judgment", "decree", "argument", "plea",
     "evidence", "proof", "document", "affidavit", "oath", "affirmation",
     "perjury", "witness", "deposition", "examination", "cross-examination",
-    "testimony", "verdict", "sentence", "appeal", "petition", "complaint",
-    "plaint", "evidence", "witness", "deposition", "affidavit",
-    "oath", "affirmation", "perjury", "testimony", "examination",
-    "deposition", "witness", "deposition", "evidence", "witness",
+    "testimony", "verdict"
   ];
   const q = query.toLowerCase();
   return legalKeywords.some(keyword => new RegExp(`\\b${keyword}\\b`).test(q));
@@ -217,15 +211,26 @@ function isLegalQuery(query) {
 app.post("/api/register", async (req, res) => {
   try {
     const { email, username, password } = req.body;
-    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
+    const usernameHash = hashUsername(username);
+
+    const existingUser = await User.findOne({ $or: [{ email }, { usernameHash }] });
     if (existingUser) {
       return res.status(400).json({
         message: existingUser.email === email ? "Email already exists" : "Username already exists",
       });
     }
+
+    const encryptedEmail = encryptText(email);
+    const encryptedUsername = encryptText(username);
     const hashedPassword = await bcrypt.hash(password, 10);
-    const user = new User({ email, username, password: hashedPassword });
+    const user = new User({
+      email: encryptedEmail,
+      username: encryptedUsername,
+      usernameHash,
+      password: hashedPassword,
+    });
     await user.save();
+
     res.status(201).json({ message: "User registered successfully" });
   } catch (error) {
     console.error("❌ Registration Error:", error);
@@ -236,12 +241,27 @@ app.post("/api/register", async (req, res) => {
 app.post("/api/login", async (req, res) => {
   try {
     const { username, password } = req.body;
-    const user = await User.findOne({ username });
+    const usernameHash = hashUsername(username);
+
+    const user = await User.findOne({ usernameHash });
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
-    const token = jwt.sign({ userId: user._id, username: user.username }, JWT_SECRET, { expiresIn: "12h" });
-    res.json({ token, user: { username: user.username, email: user.email, id: user._id } });
+    const token = jwt.sign(
+      { userId: user._id, username: decryptText(user.username) },
+      JWT_SECRET,
+      { expiresIn: "12h" }
+    );
+    const decryptedEmail = decryptText(user.email);
+
+    res.json({
+      token,
+      user: {
+        username: decryptText(user.username),
+        email: decryptedEmail,
+        id: user._id,
+      },
+    });
   } catch (error) {
     console.error("❌ Login Error:", error);
     res.status(500).json({ message: "Server error", error: error.message });
@@ -268,10 +288,7 @@ app.post("/api/chat", authenticateToken, async (req, res) => {
       return res.status(400).json({ message: "Message is required" });
     }
 
-    // Determine if the query is legally related.
     const legalFlag = isLegalQuery(message);
-
-    // Handle non-legal queries gracefully.
     if (!legalFlag) {
       return res.json({
         userMessage: message,
@@ -280,7 +297,6 @@ app.post("/api/chat", authenticateToken, async (req, res) => {
       });
     }
 
-    // Structured Prompt for Legal Queries.
     const prompt = `
 You are Juris, an AI Legal Assistance Chatbot for Indian Citizens. You answer legal queries using Indian law with exceptional accuracy by leveraging advanced language models (similar to those used by Gemini, Claude, or OpenAI). Please provide your response in the following structured format:
 
@@ -297,30 +313,22 @@ Query: ${message}
 Please provide your answer.
     `;
 
-    // Generate bot response.
     let botResponseRaw = await generateGeminiResponse(prompt);
-    // Fallback to a default response if the generated response is undefined.
     const botResponse = botResponseRaw ? botResponseRaw : "I'm sorry, I encountered an error generating a response.";
-
     const currentTime = new Date();
 
-    // Create plain text objects for summary generation.
     const userMessagePlain = { type: "user", text: message, time: currentTime };
     const botMessagePlain = { type: "bot", text: botResponse, time: currentTime };
 
-    // Retrieve or create chat history.
     let chat = await Chat.findOne({ userId });
     let plainMessagesForSummary = [];
     if (chat) {
-      // Decode all existing messages for summary generation.
       plainMessagesForSummary = chat.messages.map(m => ({
         type: m.type,
         text: decryptText(m.text),
         time: m.time
       }));
-      // Append new messages.
       plainMessagesForSummary.push(userMessagePlain, botMessagePlain);
-      // Save new messages encoded.
       chat.messages.push({ type: "user", text: encryptText(message), time: currentTime });
       chat.messages.push({ type: "bot", text: encryptText(botResponse), time: currentTime });
     } else {
@@ -334,13 +342,10 @@ Please provide your answer.
       });
     }
 
-    // Generate a chat summary using the decoded messages.
     const summaryPlain = await generateChatSummary(plainMessagesForSummary);
-    // Store the summary encoded.
     chat.chatSummary = encryptText(summaryPlain);
     await chat.save();
 
-    // Send back the plain text messages and summary.
     res.json({ userMessage: message, botResponse, chatSummary: summaryPlain });
   } catch (error) {
     console.error("❌ Error processing chat:", error);
@@ -358,16 +363,44 @@ app.post("/api/feedback", authenticateToken, async (req, res) => {
     if (satisfaction < 1 || satisfaction > 5) {
       return res.status(400).json({ message: "Satisfaction must be between 1 and 5" });
     }
+
+    const encryptedImprovements = encryptText(improvements);
+    const encryptedIssues = encryptText(issues);
+
     let feedback = await Feedback.findOne({ userId });
     if (!feedback) {
       feedback = new Feedback({ userId, feedback: [] });
     }
-    feedback.feedback.push({ improvements, issues, satisfaction });
+    feedback.feedback.push({
+      satisfaction,
+      issues: encryptedIssues,
+      improvements: encryptedImprovements
+    });
     await feedback.save();
+
     res.status(201).json({ message: "Feedback submitted successfully" });
   } catch (error) {
     console.error("❌ Error submitting feedback:", error);
     res.status(500).json({ message: "Error submitting feedback" });
+  }
+});
+
+app.get("/api/feedback", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const feedback = await Feedback.findOne({ userId });
+    if (!feedback) {
+      return res.json({ feedback: [] });
+    }
+    const decryptedFeedback = feedback.feedback.map(entry => ({
+      satisfaction: entry.satisfaction,
+      issues: decryptText(entry.issues),
+      improvements: decryptText(entry.improvements)
+    }));
+    res.json({ feedback: decryptedFeedback });
+  } catch (error) {
+    console.error("❌ Error fetching feedback:", error);
+    res.status(500).json({ message: "Error fetching feedback" });
   }
 });
 
@@ -378,12 +411,10 @@ app.get("/api/chat/history", authenticateToken, async (req, res) => {
     if (!chat) {
       return res.json({ messages: [], chatSummary: "" });
     }
-    // Decode each stored message.
     const decodedMessages = chat.messages.map(m => ({
       ...m.toObject(),
       text: decryptText(m.text)
     }));
-    // Decode the chat summary.
     const decodedSummary = chat.chatSummary ? decryptText(chat.chatSummary) : "";
     res.json({ messages: decodedMessages, chatSummary: decodedSummary });
   } catch (error) {
