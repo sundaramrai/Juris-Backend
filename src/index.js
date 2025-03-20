@@ -1,3 +1,4 @@
+// src/index.js
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
@@ -7,7 +8,6 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const crypto = require("crypto");
 require("dotenv").config();
 
-// Validate required environment variables
 const requiredEnvVars = [
   "MONGO_URI",
   "JWT_SECRET",
@@ -34,14 +34,14 @@ app.use(express.json());
 const MONGO_URI = process.env.MONGO_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // Must be a 64-character hex string (32 bytes)
-const USERNAME_HASH_SALT = process.env.USERNAME_HASH_SALT; // Deterministic salt for username hashing
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const USERNAME_HASH_SALT = process.env.USERNAME_HASH_SALT;
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 const algorithm = "aes-256-gcm";
-const IV_LENGTH = 16; // For AES, this is always 16 bytes.
+const IV_LENGTH = 16;
 
 mongoose
   .connect(MONGO_URI, {
@@ -95,7 +95,6 @@ const authenticateToken = (req, res, next) => {
 };
 
 function encryptText(text) {
-  // Ensure text is a string; if not, default to an empty string.
   if (typeof text !== 'string') {
     text = text ? text.toString() : "";
   }
@@ -129,7 +128,6 @@ function decryptText(encryptedText) {
   return decrypted;
 }
 
-// Deterministic hashing for username using HMAC-SHA256 with a constant salt.
 function hashUsername(username) {
   return crypto
     .createHmac("sha256", USERNAME_HASH_SALT)
