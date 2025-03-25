@@ -6,6 +6,7 @@ const bcrypt = require("bcrypt");
 const mongoose = require("mongoose");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const crypto = require("crypto");
+const nodemailer = require("nodemailer");
 require("dotenv").config();
 
 const requiredEnvVars = [
@@ -13,7 +14,10 @@ const requiredEnvVars = [
   "JWT_SECRET",
   "GEMINI_API_KEY",
   "ENCRYPTION_KEY",
-  "USERNAME_HASH_SALT"
+  "USERNAME_HASH_SALT",
+  "EMAIL_USER",
+  "EMAIL_PASS",
+  "OTP_SECRET"
 ];
 const missingVars = requiredEnvVars.filter(key => !process.env[key]);
 if (missingVars.length > 0) {
@@ -42,6 +46,10 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 const algorithm = "aes-256-gcm";
 const IV_LENGTH = 16;
+
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = process.env.EMAIL_PASS;
+const OTP_SECRET = process.env.OTP_SECRET;
 
 mongoose
   .connect(MONGO_URI, {
@@ -204,6 +212,51 @@ function isLegalQuery(query) {
   ];
   const q = query.toLowerCase();
   return legalKeywords.some(keyword => new RegExp(`\\b${keyword}\\b`).test(q));
+}
+
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: EMAIL_USER,
+    pass: EMAIL_PASS
+  }
+});
+
+const otpStorage = new Map();
+
+function generateOTP() {
+  return crypto.randomInt(100000, 999999).toString();
+}
+
+function sendOTPEmail(email, otp) {
+  const mailOptions = {
+    from: EMAIL_USER,
+    to: email,
+    subject: 'Verify Your Email - Juris Master Registration',
+    html: `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <div style="text-align: center; padding: 20px; background-color: #f4f4f4; border-bottom: 2px solid #007bff;">
+          <h1 style="color: #007bff; margin: 0;">Juris Master</h1>
+          <p style="margin: 0; font-size: 16px;">Your Trusted Legal Assistance Platform</p>
+        </div>
+        <div style="padding: 20px;">
+          <h2 style="color: #007bff;">Email Verification</h2>
+          <p>Dear User,</p>
+          <p>Thank you for registering with Juris Master. To complete your registration, please use the following One-Time Password (OTP):</p>
+          <div style="text-align: center; margin: 20px 0;">
+            <span style="font-size: 24px; font-weight: bold; color: #007bff;">${otp}</span>
+          </div>
+          <p>This OTP is valid for <strong>10 minutes</strong>. Please enter it on the registration page to verify your email address.</p>
+          <p>If you did not request this email, please ignore it. Your account will not be created unless the OTP is used.</p>
+        </div>
+        <div style="text-align: center; padding: 10px; background-color: #f4f4f4; border-top: 2px solid #007bff;">
+          <p style="margin: 0; font-size: 14px; color: #555;">&copy; ${new Date().getFullYear()} Juris Master. All rights reserved.</p>
+        </div>
+      </div>
+    `
+  };
+
+  return transporter.sendMail(mailOptions);
 }
 
 app.post("/api/register", async (req, res) => {
@@ -429,6 +482,78 @@ app.delete("/api/chat/history", authenticateToken, async (req, res) => {
   } catch (error) {
     console.error("❌ Error clearing chat history:", error);
     res.status(500).json({ message: "Error clearing chat history" });
+  }
+});
+
+app.post("/api/register/request-otp", async (req, res) => {
+  try {
+    const { email, username, password } = req.body;
+    const usernameHash = hashUsername(username);
+
+    const existingUser = await User.findOne({ $or: [{ email }, { usernameHash }] });
+    if (existingUser) {
+      return res.status(400).json({
+        message: existingUser.email === email ? "Email already exists" : "Username already exists",
+      });
+    }
+
+    const otp = generateOTP();
+    const otpExpiry = Date.now() + 10 * 60 * 1000;
+
+    otpStorage.set(email, {
+      otp: crypto.createHmac('sha256', OTP_SECRET).update(otp).digest('hex'),
+      expiry: otpExpiry,
+      userData: { email, username, password }
+    });
+
+    await sendOTPEmail(email, otp);
+
+    res.status(200).json({ message: "OTP sent successfully", email });
+  } catch (error) {
+    console.error("❌ OTP Request Error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+});
+
+app.post("/api/register/verify-otp", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    const otpData = otpStorage.get(email);
+
+    if (!otpData) {
+      return res.status(400).json({ message: "No OTP request found" });
+    }
+
+    if (Date.now() > otpData.expiry) {
+      otpStorage.delete(email);
+      return res.status(400).json({ message: "OTP has expired" });
+    }
+
+    const hashedOTP = crypto.createHmac('sha256', OTP_SECRET).update(otp).digest('hex');
+    if (hashedOTP !== otpData.otp) {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+    const { username, password } = otpData.userData;
+    const usernameHash = hashUsername(username);
+
+    const encryptedEmail = encryptText(email);
+    const encryptedUsername = encryptText(username);
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = new User({
+      email: encryptedEmail,
+      username: encryptedUsername,
+      usernameHash,
+      password: hashedPassword,
+    });
+    await user.save();
+
+    otpStorage.delete(email);
+
+    res.status(201).json({ message: "User registered successfully" });
+  } catch (error) {
+    console.error("❌ OTP Verification Error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
   }
 });
 
