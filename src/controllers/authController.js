@@ -16,17 +16,17 @@ function sendOTPEmail(email, otp) {
   const mailOptions = {
     from: process.env.EMAIL_USER,
     to: email,
-    subject: 'Verify Your Email - Juris Master Registration',
+    subject: 'Verify Your Email - Juris Legal AI Registration',
     html: `
       <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
         <div style="text-align: center; padding: 20px; background-color: #f4f4f4; border-bottom: 2px solid #007bff;">
-          <h1 style="color: #007bff; margin: 0;">Juris Master</h1>
+          <h1 style="color: #007bff; margin: 0;">Juris Legal AI</h1>
           <p style="margin: 0; font-size: 16px;">Your Trusted Legal Assistance Platform</p>
         </div>
         <div style="padding: 20px;">
           <h2 style="color: #007bff;">Email Verification</h2>
           <p>Dear User,</p>
-          <p>Thank you for registering with Juris Master. To complete your registration, please use the following One-Time Password (OTP):</p>
+          <p>Thank you for registering with Juris Legal AI. To complete your registration, please use the following One-Time Password (OTP):</p>
           <div style="text-align: center; margin: 20px 0;">
             <span style="font-size: 24px; font-weight: bold; color: #007bff;">${otp}</span>
           </div>
@@ -34,7 +34,7 @@ function sendOTPEmail(email, otp) {
           <p>If you did not request this email, please ignore it. Your account will not be created unless the OTP is used.</p>
         </div>
         <div style="text-align: center; padding: 10px; background-color: #f4f4f4; border-top: 2px solid #007bff;">
-          <p style="margin: 0; font-size: 14px; color: #555;">&copy; ${new Date().getFullYear()} Juris Master. All rights reserved.</p>
+          <p style="margin: 0; font-size: 14px; color: #555;">&copy; ${new Date().getFullYear()} Juris Legal AI. All rights reserved.</p>
         </div>
       </div>
     `

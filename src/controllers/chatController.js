@@ -1,11 +1,12 @@
 // src/controllers/chatController.js
 const Chat = require("../models/Chat");
+const { v4: uuidv4 } = require("uuid");
 const { encryptText, decryptText } = require("../utils/encryption");
 const { isLegalQuery, generateGeminiResponse, generateChatSummary } = require("../services/aiService");
 
 exports.processChat = async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, chatId } = req.body;
     const userId = req.user.userId;
 
     if (!message) {
@@ -44,7 +45,10 @@ Please provide your answer.
     const userMessagePlain = { type: "user", text: message, time: currentTime };
     const botMessagePlain = { type: "bot", text: botResponse, time: currentTime };
 
-    let chat = await Chat.findOne({ userId });
+    let chat;
+    if (chatId) {
+      chat = await Chat.findOne({ userId, chatId });
+    }
     let plainMessagesForSummary = [];
     if (chat) {
       plainMessagesForSummary = chat.messages.map(m => ({
@@ -56,9 +60,11 @@ Please provide your answer.
       chat.messages.push({ type: "user", text: encryptText(message), time: currentTime });
       chat.messages.push({ type: "bot", text: encryptText(botResponse), time: currentTime });
     } else {
+      const newChatId = chatId || uuidv4();
       plainMessagesForSummary = [userMessagePlain, botMessagePlain];
       chat = new Chat({
         userId,
+        chatId: newChatId,
         messages: [
           { type: "user", text: encryptText(message), time: currentTime },
           { type: "bot", text: encryptText(botResponse), time: currentTime }
@@ -66,30 +72,87 @@ Please provide your answer.
       });
     }
 
+    if (!chat.title || chat.title === "New Chat") {
+      const titleMatch = botResponse.match(/\*\*Title:\*\*\s*(.*?)(?:\n|$)/i) ||
+        botResponse.match(/^Title:\s*(.*?)(?:\n|$)/i);
+      if (titleMatch && titleMatch[1]) {
+        chat.title = titleMatch[1].trim().substring(0, 100);
+      }
+    }
+
     const summaryPlain = await generateChatSummary(plainMessagesForSummary);
-    chat.chatSummary = encryptText(summaryPlain);
+    chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
     await chat.save();
 
-    res.json({ userMessage: message, botResponse, chatSummary: summaryPlain });
+    res.json({ chatId: chat.chatId, userMessage: message, botResponse, chatSummary: summaryPlain, title: chat.title });
   } catch (error) {
     console.error("❌ Error processing chat:", error);
     res.status(500).json({ message: "Error processing chat" });
   }
 };
 
+exports.getAllChats = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const skip = (page - 1) * limit;
+
+    const chats = await Chat.find({ userId })
+      .sort({ updatedAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .select('chatId title chatSummary createdAt updatedAt messages')
+      .maxTimeMS(30000);
+
+    const formattedChats = chats
+      .filter(chat => chat.messages && chat.messages.length > 0)
+      .map(chat => ({
+        chatId: chat.chatId,
+        title: chat.title,
+        summary: chat.chatSummary ? decryptText(chat.chatSummary) : "",
+        messageCount: chat.messages.length,
+        createdAt: chat.createdAt,
+        updatedAt: chat.updatedAt
+      }));
+
+    res.json({
+      chats: formattedChats,
+      pagination: {
+        page,
+        limit,
+        hasMore: chats.length === limit
+      }
+    });
+  } catch (error) {
+    console.error("❌ Error fetching all chats:", error);
+    res.status(500).json({ message: "Error fetching chats. Please try again." });
+  }
+};
+
 exports.getChatHistory = async (req, res) => {
   try {
     const userId = req.user.userId;
-    const chat = await Chat.findOne({ userId });
+    const { chatId } = req.params;
+
+    if (!chatId) {
+      return res.status(400).json({ message: "Chat ID is required" });
+    }
+    const chat = await Chat.findOne({ userId, chatId });
     if (!chat) {
-      return res.json({ messages: [], chatSummary: "" });
+      return res.status(404).json({ message: "Chat not found" });
     }
     const decodedMessages = chat.messages.map(m => ({
       ...m.toObject(),
       text: decryptText(m.text)
     }));
     const decodedSummary = chat.chatSummary ? decryptText(chat.chatSummary) : "";
-    res.json({ messages: decodedMessages, chatSummary: decodedSummary });
+    res.json({
+      chatId: chat.chatId,
+      title: chat.title,
+      messages: decodedMessages,
+      chatSummary: decodedSummary
+    });
   } catch (error) {
     console.error("❌ Error fetching chat history:", error);
     res.status(500).json({ message: "Error fetching chat history" });
@@ -99,10 +162,98 @@ exports.getChatHistory = async (req, res) => {
 exports.clearChatHistory = async (req, res) => {
   try {
     const userId = req.user.userId;
-    await Chat.findOneAndDelete({ userId });
+    const { chatId } = req.params;
+
+    if (!chatId) {
+      return res.status(400).json({ message: "Chat ID is required" });
+    }
+    const chat = await Chat.findOneAndUpdate(
+      { userId, chatId },
+      { $set: { messages: [], chatSummary: "" } },
+      { new: true }
+    );
+
+    if (!chat) {
+      return res.status(404).json({ message: "Chat not found" });
+    }
+
     res.json({ message: "Chat history cleared" });
   } catch (error) {
     console.error("❌ Error clearing chat history:", error);
     res.status(500).json({ message: "Error clearing chat history" });
+  }
+};
+
+exports.cleanupEmptyChats = async (req, res) => {
+  try {
+    if (!req.user.isAdmin) {
+      return res.status(403).json({ message: "Unauthorized" });
+    }
+
+    const result = await Chat.deleteMany({ "messages": { $size: 0 } });
+
+    res.json({
+      message: "Cleanup completed",
+      deletedCount: result.deletedCount
+    });
+  } catch (error) {
+    console.error("❌ Error during manual chat cleanup:", error);
+    res.status(500).json({ message: "Error during cleanup" });
+  }
+};
+
+exports.createNewChat = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const chatId = uuidv4();
+
+    const newChat = new Chat({
+      userId,
+      chatId,
+      title: "New Chat",
+      messages: []
+    });
+
+    await newChat.save();
+    res.json({
+      chatId: newChat.chatId,
+      title: newChat.title,
+      messages: [],
+      chatSummary: ""
+    });
+  } catch (error) {
+    console.error("❌ Error creating new chat:", error);
+    res.status(500).json({ message: "Error creating new chat" });
+  }
+};
+
+exports.updateChatTitle = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { chatId } = req.params;
+    const { title } = req.body;
+
+    if (!chatId) {
+      return res.status(400).json({ message: "Chat ID is required" });
+    }
+
+    if (!title) {
+      return res.status(400).json({ message: "Title is required" });
+    }
+
+    const chat = await Chat.findOneAndUpdate(
+      { userId, chatId },
+      { title },
+      { new: true }
+    );
+
+    if (!chat) {
+      return res.status(404).json({ message: "Chat not found" });
+    }
+
+    res.json({ chatId: chat.chatId, title: chat.title });
+  } catch (error) {
+    console.error("❌ Error updating chat title:", error);
+    res.status(500).json({ message: "Error updating chat title" });
   }
 };
