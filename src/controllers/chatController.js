@@ -2,60 +2,95 @@
 const Chat = require("../models/Chat");
 const { v4: uuidv4 } = require("uuid");
 const { encryptText, decryptText } = require("../utils/encryption");
-const { isLegalQuery, generateGeminiResponse, generateChatSummary } = require("../services/aiService");
+const {
+  generateChatSummary,
+  processQuery,
+  getServiceMetrics,
+  withRetry
+} = require("../services/aiService");
+
+const chatCache = new Map();
+const CHAT_CACHE_SIZE = 100;
+const CHAT_CACHE_TTL = 15 * 60 * 1000;
+
+const handleError = (res, error, message, statusCode = 500) => {
+  console.error(`❌ ${message}:`, error);
+  return res.status(statusCode).json({
+    message,
+    error: process.env.NODE_ENV === 'development' ? error.message : undefined
+  });
+};
+
+const getCachedChat = (userId, chatId) => {
+  const key = `${userId}:${chatId}`;
+  const cached = chatCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CHAT_CACHE_TTL) {
+    return cached.data;
+  }
+  chatCache.delete(key);
+  return null;
+};
+
+const setCachedChat = (userId, chatId, data) => {
+  const key = `${userId}:${chatId}`;
+  if (chatCache.size >= CHAT_CACHE_SIZE) {
+    const oldestKey = chatCache.keys().next().value;
+    chatCache.delete(oldestKey);
+  }
+  chatCache.set(key, {
+    data,
+    timestamp: Date.now()
+  });
+  return data;
+};
+
+const invalidateUserChatCache = (userId) => {
+  for (const [key] of chatCache) {
+    if (key.startsWith(`${userId}:`)) {
+      chatCache.delete(key);
+    }
+  }
+};
 
 exports.processChat = async (req, res) => {
   try {
     const { message, chatId } = req.body;
     const userId = req.user.userId;
 
-    if (!message) {
-      return res.status(400).json({ message: "Message is required" });
+    if (!message || message.trim() === '') {
+      return res.status(400).json({ message: "Message is required and cannot be empty" });
     }
+    const { response: botResponse, classification: queryClassification } =
+      await withRetry(() => processQuery(message), 2);
 
-    const legalFlag = isLegalQuery(message);
-    if (!legalFlag) {
-      return res.json({
-        userMessage: message,
-        botResponse: "**This query does not appear to be related to legal matters. Please ask questions related to legal queries for accurate guidance.**",
-        chatSummary: "Non-legal query detected."
-      });
-    }
-
-    const prompt = `
-You are Juris, an AI Legal Assistance Chatbot for Indian Citizens. You answer legal queries using Indian law with exceptional accuracy by leveraging advanced language models (similar to those used by Gemini, Claude, or OpenAI). Please provide your response in the following structured format:
-
-1. **Title:** [A short title reflecting the query]
-2. **Summary:** A brief overview of the legal issue.
-3. **Relevant Legal Provisions:** List the specific acts, sections, or legal precedents relevant to the query.
-4. **Analysis:** A detailed explanation of how the law applies to the query.
-5. **Real life incidents:** Provide examples of real-life incidents related to this query in India.
-6. **Conclusion:** Summarize the main points and provide a clear answer.
-7. **References:** Cite any relevant sources or legal references.
-
-Query: ${message}
-
-Please provide your answer.
-    `;
-
-    let botResponseRaw = await generateGeminiResponse(prompt);
-    const botResponse = botResponseRaw ? botResponseRaw : "I'm sorry, I encountered an error generating a response.";
     const currentTime = new Date();
-
     const userMessagePlain = { type: "user", text: message, time: currentTime };
     const botMessagePlain = { type: "bot", text: botResponse, time: currentTime };
 
     let chat;
     if (chatId) {
-      chat = await Chat.findOne({ userId, chatId });
+      chat = getCachedChat(userId, chatId);
+      if (!chat) {
+        chat = await Chat.findOne({ userId, chatId });
+      }
     }
+
     let plainMessagesForSummary = [];
+    let messageCount = 0;
+
     if (chat) {
-      plainMessagesForSummary = chat.messages.map(m => ({
-        type: m.type,
-        text: decryptText(m.text),
-        time: m.time
-      }));
+      if (chat.messages) {
+        plainMessagesForSummary = chat.messages.map(m => ({
+          type: m.type,
+          text: typeof m.text === 'string' ? decryptText(m.text) : m.text,
+          time: m.time
+        }));
+        messageCount = chat.messages.length;
+      } else {
+        plainMessagesForSummary = [];
+        chat.messages = [];
+      }
+
       plainMessagesForSummary.push(userMessagePlain, botMessagePlain);
       chat.messages.push({ type: "user", text: encryptText(message), time: currentTime });
       chat.messages.push({ type: "bot", text: encryptText(botResponse), time: currentTime });
@@ -73,10 +108,20 @@ Please provide your answer.
     }
 
     if (!chat.title || chat.title === "New Chat") {
-      const titleMatch = botResponse.match(/\*\*Title:\*\*\s*(.*?)(?:\n|$)/i) ||
-        botResponse.match(/^Title:\s*(.*?)(?:\n|$)/i);
-      if (titleMatch && titleMatch[1]) {
-        chat.title = titleMatch[1].trim().substring(0, 100);
+      if (queryClassification.isLegal) {
+        const titleMatch = botResponse.match(/\*\*Title:\*\*\s*(.*?)(?:\n|$)/i) ||
+          botResponse.match(/^Title:\s*(.*?)(?:\n|$)/i);
+        if (titleMatch && titleMatch[1]) {
+          chat.title = titleMatch[1].trim().substring(0, 100);
+        } else if (queryClassification.specificLaws && queryClassification.specificLaws.length > 0) {
+          chat.title = `Query about ${queryClassification.specificLaws[0]}`;
+        } else {
+          chat.title = `${queryClassification.subCategory || 'Legal'} Query`;
+        }
+      } else {
+        chat.title = queryClassification.category === "general_chat"
+          ? "General Conversation"
+          : `${queryClassification.category.replace(/_/g, ' ')} Query`;
       }
     }
 
@@ -84,10 +129,22 @@ Please provide your answer.
     chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
     await chat.save();
 
-    res.json({ chatId: chat.chatId, userMessage: message, botResponse, chatSummary: summaryPlain, title: chat.title });
+    invalidateUserChatCache(userId);
+    setCachedChat(userId, chat.chatId, chat);
+
+    res.json({
+      chatId: chat.chatId,
+      userMessage: message,
+      botResponse,
+      chatSummary: summaryPlain,
+      title: chat.title,
+      category: queryClassification.category,
+      isLegal: queryClassification.isLegal,
+      messageCount: messageCount + 2,
+      complexity: queryClassification.complexity || 1
+    });
   } catch (error) {
-    console.error("❌ Error processing chat:", error);
-    res.status(500).json({ message: "Error processing chat" });
+    return handleError(res, error, "Error processing chat");
   }
 };
 
@@ -107,26 +164,45 @@ exports.getAllChats = async (req, res) => {
 
     const formattedChats = chats
       .filter(chat => chat.messages && chat.messages.length > 0)
-      .map(chat => ({
-        chatId: chat.chatId,
-        title: chat.title,
-        summary: chat.chatSummary ? decryptText(chat.chatSummary) : "",
-        messageCount: chat.messages.length,
-        createdAt: chat.createdAt,
-        updatedAt: chat.updatedAt
-      }));
+      .map(chat => {
+        const chatItem = {
+          chatId: chat.chatId,
+          title: chat.title,
+          messageCount: chat.messages.length,
+          createdAt: chat.createdAt,
+          updatedAt: chat.updatedAt
+        };
+        if (chat.chatSummary) {
+          try {
+            chatItem.summary = decryptText(chat.chatSummary);
+          } catch (e) {
+            chatItem.summary = "Summary unavailable";
+          }
+        } else {
+          chatItem.summary = "";
+        }
+
+        return chatItem;
+      });
+
+    formattedChats.forEach(chat => {
+      const fullChat = chats.find(c => c.chatId === chat.chatId);
+      if (fullChat) {
+        setCachedChat(userId, chat.chatId, fullChat);
+      }
+    });
 
     res.json({
       chats: formattedChats,
       pagination: {
         page,
         limit,
-        hasMore: chats.length === limit
+        hasMore: chats.length === limit,
+        totalPages: Math.ceil(await Chat.countDocuments({ userId }) / limit)
       }
     });
   } catch (error) {
-    console.error("❌ Error fetching all chats:", error);
-    res.status(500).json({ message: "Error fetching chats. Please try again." });
+    return handleError(res, error, "Error fetching all chats");
   }
 };
 
@@ -138,24 +214,50 @@ exports.getChatHistory = async (req, res) => {
     if (!chatId) {
       return res.status(400).json({ message: "Chat ID is required" });
     }
-    const chat = await Chat.findOne({ userId, chatId });
+    let chat = getCachedChat(userId, chatId);
+    if (!chat) {
+      chat = await Chat.findOne({ userId, chatId });
+      if (chat) {
+        setCachedChat(userId, chatId, chat);
+      }
+    }
+
     if (!chat) {
       return res.status(404).json({ message: "Chat not found" });
     }
-    const decodedMessages = chat.messages.map(m => ({
-      ...m.toObject(),
-      text: decryptText(m.text)
-    }));
-    const decodedSummary = chat.chatSummary ? decryptText(chat.chatSummary) : "";
+    const decodedMessages = chat.messages.map(m => {
+      try {
+        return {
+          ...m.toObject ? m.toObject() : m,
+          text: decryptText(m.text)
+        };
+      } catch (e) {
+        return {
+          ...m.toObject ? m.toObject() : m,
+          text: "Message couldn't be decrypted"
+        };
+      }
+    });
+
+    let decodedSummary = "";
+    if (chat.chatSummary) {
+      try {
+        decodedSummary = decryptText(chat.chatSummary);
+      } catch (e) {
+        decodedSummary = "Summary unavailable";
+      }
+    }
+
     res.json({
       chatId: chat.chatId,
       title: chat.title,
       messages: decodedMessages,
-      chatSummary: decodedSummary
+      chatSummary: decodedSummary,
+      createdAt: chat.createdAt,
+      updatedAt: chat.updatedAt
     });
   } catch (error) {
-    console.error("❌ Error fetching chat history:", error);
-    res.status(500).json({ message: "Error fetching chat history" });
+    return handleError(res, error, "Error fetching chat history");
   }
 };
 
@@ -237,13 +339,14 @@ exports.updateChatTitle = async (req, res) => {
       return res.status(400).json({ message: "Chat ID is required" });
     }
 
-    if (!title) {
-      return res.status(400).json({ message: "Title is required" });
+    if (!title || title.trim() === '') {
+      return res.status(400).json({ message: "Title is required and cannot be empty" });
     }
 
+    const sanitizedTitle = title.trim().substring(0, 100);
     const chat = await Chat.findOneAndUpdate(
       { userId, chatId },
-      { title },
+      { title: sanitizedTitle },
       { new: true }
     );
 
@@ -251,9 +354,68 @@ exports.updateChatTitle = async (req, res) => {
       return res.status(404).json({ message: "Chat not found" });
     }
 
+    if (getCachedChat(userId, chatId)) {
+      setCachedChat(userId, chatId, chat);
+    }
+
     res.json({ chatId: chat.chatId, title: chat.title });
   } catch (error) {
-    console.error("❌ Error updating chat title:", error);
-    res.status(500).json({ message: "Error updating chat title" });
+    return handleError(res, error, "Error updating chat title");
+  }
+};
+
+exports.deleteChat = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { chatId } = req.params;
+
+    if (!chatId) {
+      return res.status(400).json({ message: "Chat ID is required" });
+    }
+
+    const result = await Chat.findOneAndDelete({ userId, chatId });
+
+    if (!result) {
+      return res.status(404).json({ message: "Chat not found" });
+    }
+    const key = `${userId}:${chatId}`;
+    chatCache.delete(key);
+
+    res.json({ message: "Chat deleted successfully", chatId });
+  } catch (error) {
+    return handleError(res, error, "Error deleting chat");
+  }
+};
+
+exports.getServiceStatus = async (req, res) => {
+  if (!req.user.isAdmin) {
+    return res.status(403).json({ message: "Unauthorized" });
+  }
+
+  try {
+    const metrics = getServiceMetrics();
+    const dbStats = {
+      chatCount: await Chat.countDocuments(),
+      avgChatSize: await Chat.aggregate([
+        { $project: { messageCount: { $size: "$messages" } } },
+        { $group: { _id: null, avg: { $avg: "$messageCount" } } }
+      ]).then(result => result[0]?.avg || 0)
+    };
+
+    res.json({
+      status: "operational",
+      cacheStatus: {
+        chatCache: {
+          size: chatCache.size,
+          maxSize: CHAT_CACHE_SIZE
+        },
+        ...metrics.caches
+      },
+      performance: metrics.performance,
+      database: dbStats,
+      memory: process.memoryUsage()
+    });
+  } catch (error) {
+    return handleError(res, error, "Error fetching service status");
   }
 };
