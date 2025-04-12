@@ -2,7 +2,13 @@
 const { model } = require("../config/ai");
 require('events').EventEmitter.defaultMaxListeners = 20;
 
-const MAX_CACHE_SIZE = 500;
+const MAX_CACHE_SIZE = 1000;
+const CACHE_TTL = 24 * 60 * 60 * 1000;
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
+const REQUEST_TIMEOUT = 15000;
+const BATCH_SIZE = 5;
+
 const INDIAN_LANGUAGE_REGEX = /[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B00-\u0B7F\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F]/;
 const EMERGENCY_REGEX = /urgent|emergency|immediately|asap|right now|hurry|quickly/;
 const FRUSTRATED_REGEX = /frustrated|angry|upset|annoyed|ridiculous|absurd|unfair|terrible/;
@@ -65,30 +71,41 @@ const legalCategories = {
   "banking": new Set(["loan", "mortgage", "interest", "default", "NPA", "recovery", "DRT", "SARFAESI", "foreclosure", "credit card", "banking ombudsman", "negotiable instrument", "cheque bounce", "138 NI Act"])
 };
 
-class PerformanceCache {
-  constructor(maxSize = 100, ttlMs = 3600000) {
+class AdvancedPerformanceCache {
+  constructor(maxSize = 100, ttlMs = 3600000, name = 'cache') {
     this.cache = new Map();
     this.maxSize = maxSize;
     this.ttlMs = ttlMs;
+    this.name = name;
     this.hits = 0;
     this.misses = 0;
     this.total = 0;
+    this.evictions = 0;
+    this.errors = 0;
+    this.lastCleanup = Date.now();
+    this.cleanupInterval = 60 * 60 * 1000;
   }
 
   set(key, value) {
+    this._performCleanupIfNeeded();
+
     if (this.cache.size >= this.maxSize) {
       const oldestKey = this.cache.keys().next().value;
       this.cache.delete(oldestKey);
+      this.evictions++;
     }
+
     this.cache.set(key, {
       value,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      accessCount: 0
     });
     return value;
   }
 
   get(key) {
     this.total++;
+    this._performCleanupIfNeeded();
     if (!this.cache.has(key)) {
       this.misses++;
       return null;
@@ -100,7 +117,8 @@ class PerformanceCache {
       this.misses++;
       return null;
     }
-
+    entry.accessCount++;
+    entry.lastAccessed = Date.now();
     this.hits++;
     return entry.value;
   }
@@ -115,14 +133,35 @@ class PerformanceCache {
     return true;
   }
 
+  _performCleanupIfNeeded() {
+    const now = Date.now();
+    if (now - this.lastCleanup > this.cleanupInterval) {
+      this._cleanup();
+      this.lastCleanup = now;
+    }
+  }
+
+  _cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now - entry.timestamp > this.ttlMs) {
+        this.cache.delete(key);
+        this.evictions++;
+      }
+    }
+  }
+
   getStats() {
     return {
+      name: this.name,
       size: this.cache.size,
       maxSize: this.maxSize,
       hitRate: this.total > 0 ? (this.hits / this.total) * 100 : 0,
       hits: this.hits,
       misses: this.misses,
-      total: this.total
+      total: this.total,
+      evictions: this.evictions,
+      errors: this.errors
     };
   }
 
@@ -131,35 +170,93 @@ class PerformanceCache {
     this.hits = 0;
     this.misses = 0;
     this.total = 0;
+    this.evictions = 0;
+    this.errors = 0;
   }
 }
 
-const classificationCache = new PerformanceCache(MAX_CACHE_SIZE);
-const responseCache = new PerformanceCache(MAX_CACHE_SIZE);
-const dynamicClassificationCache = new PerformanceCache(MAX_CACHE_SIZE);
-
+const classificationCache = new AdvancedPerformanceCache(MAX_CACHE_SIZE, CACHE_TTL, 'classification');
+const responseCache = new AdvancedPerformanceCache(MAX_CACHE_SIZE * 2, CACHE_TTL, 'response');
+const dynamicClassificationCache = new AdvancedPerformanceCache(MAX_CACHE_SIZE, CACHE_TTL, 'dynamicClassification');
 const performanceMetrics = {
   aiCalls: 0,
   aiErrors: 0,
   avgResponseTime: 0,
   totalResponseTime: 0,
-  startTime: Date.now()
+  maxResponseTime: 0,
+  minResponseTime: Number.MAX_SAFE_INTEGER,
+  responseTimes: [],
+  requestsPerMinute: 0,
+  lastMinuteRequests: [],
+  startTime: Date.now(),
+  timeouts: 0,
+  retries: 0,
+  successfulRetries: 0
 };
 
-async function withRetry(fn, maxRetries = 3, delay = 1000) {
+async function withRetry(fn, maxRetries = MAX_RETRIES, initialDelay = RETRY_DELAY, shouldThrow = false) {
   let lastError;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  let attempt = 1;
+
+  while (attempt <= maxRetries) {
     try {
-      return await fn();
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`Request timed out after ${REQUEST_TIMEOUT}ms`));
+        }, REQUEST_TIMEOUT);
+      });
+      const result = await Promise.race([fn(), timeoutPromise]);
+      if (attempt > 1) {
+        performanceMetrics.successfulRetries++;
+      }
+
+      return result;
     } catch (error) {
       console.error(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
       lastError = error;
+      performanceMetrics.retries++;
+
+      if (error.message.includes('timed out')) {
+        performanceMetrics.timeouts++;
+      }
+
       if (attempt < maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, delay * attempt));
+        const delay = initialDelay * Math.pow(2, attempt - 1);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        attempt++;
+      } else {
+        break;
       }
     }
   }
-  throw lastError;
+
+  if (shouldThrow) {
+    throw lastError;
+  }
+
+  return {
+    response: "I'm sorry, I'm having trouble processing your request right now. Please try again in a moment.",
+    classification: {
+      isLegal: false,
+      category: "error",
+      confidence: 0
+    },
+    error: lastError
+  };
+}
+
+async function batchProcessQueries(queries) {
+  if (!queries || !queries.length) return [];
+
+  const results = [];
+  for (let i = 0; i < queries.length; i += BATCH_SIZE) {
+    const batch = queries.slice(i, i + BATCH_SIZE);
+    const batchPromises = batch.map(query => processQuery(query));
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+  }
+
+  return results;
 }
 
 async function classifyQueryWithGemini(query) {
@@ -173,32 +270,52 @@ async function classifyQueryWithGemini(query) {
 
   try {
     const classificationPrompt = `
-Analyze the following query text and classify it according to these parameters:
-1. Is it a legal query related to Indian law? (true/false)
-2. What is the confidence level? (0-1)
-3. What category does it fall under? Choose from: 
-   - If legal: "legal"
-   - If non-legal: "general_chat", "technical_support", "feedback", "related_services", or "non_legal"
-4. If legal, what subcategory? Choose from: "criminal", "civil", "family", "constitutional", 
-   "property", "labor", "tax", "consumer", "motor vehicle", "banking", or "general"
-5. What type of request is it? Choose from: "information", "procedural", "advice", "resource"
-6. What is the sentiment? Choose from: "neutral", "urgent", "frustrated", "confused", "positive"
-7. Assess the complexity of the query on a scale of 1-5.
-8. Identify any specific Indian laws or sections mentioned.
+Analyze the following query text and classify it according to these parameters. Be very precise in your classification.
 
-Format your answer as a JSON object with these fields: 
-{ "isLegal": boolean, "confidence": number, "category": string, "subCategory": string or null, 
-"requestType": string, "sentiment": string, "complexity": number, "specificLaws": string[] }
+Query: "${query}"
 
-Query: ${query}
+Required output format (JSON):
+{
+  "isLegal": boolean,
+  "confidence": number 0-1,
+  "category": string,
+  "subCategory": string or null,
+  "requestType": string,
+  "sentiment": string,
+  "complexity": number 1-5,
+  "specificLaws": string[]
+}
+
+For isLegal: true only if the query directly relates to Indian law, regulations, rights, or legal procedures.
+For category: Use "legal" if isLegal is true, otherwise use "general_chat", "technical_support", "feedback", or "related_services".
+For subCategory: If legal, choose one: "criminal", "civil", "family", "constitutional", "property", "labor", "tax", "consumer", "motor vehicle", "banking", or "general".
+For requestType: Choose from "information", "procedural", "advice", or "resource".
+For sentiment: Analyze emotion as "neutral", "urgent", "frustrated", "confused", or "positive".
+For complexity: Rate 1 (simple) to 5 (complex) based on technical/legal depth required.
+For specificLaws: Identify specific Indian laws, acts, or sections mentioned (empty array if none).
 `;
 
-    const result = await withRetry(async () => await model.generateContent(classificationPrompt), 2);
+    const result = await withRetry(async () => {
+      return await model.generateContent(classificationPrompt);
+    }, 2);
+
     const responseText = await result.response.text();
     let extractedJson = responseText.trim();
     const endTime = Date.now();
-    performanceMetrics.totalResponseTime += (endTime - startTime);
+    const responseTime = endTime - startTime;
+
+    performanceMetrics.totalResponseTime += responseTime;
     performanceMetrics.avgResponseTime = performanceMetrics.totalResponseTime / performanceMetrics.aiCalls;
+    performanceMetrics.maxResponseTime = Math.max(performanceMetrics.maxResponseTime, responseTime);
+    performanceMetrics.minResponseTime = Math.min(performanceMetrics.minResponseTime, responseTime);
+    performanceMetrics.responseTimes.push(responseTime);
+    if (performanceMetrics.responseTimes.length > 100) {
+      performanceMetrics.responseTimes.shift();
+    }
+    const now = Date.now();
+    performanceMetrics.lastMinuteRequests.push(now);
+    performanceMetrics.lastMinuteRequests = performanceMetrics.lastMinuteRequests.filter(t => now - t < 60000);
+    performanceMetrics.requestsPerMinute = performanceMetrics.lastMinuteRequests.length;
 
     if (extractedJson.startsWith('```json')) {
       extractedJson = extractedJson.substring(7, extractedJson.length - 3).trim();
@@ -222,19 +339,12 @@ Query: ${query}
         return dynamicClassificationCache.set(cacheKey, completeClassification);
       } catch (parseError) {
         console.error("Failed to parse classification JSON:", parseError);
+        dynamicClassificationCache.errors++;
       }
     }
   } catch (error) {
     console.error("Error in Gemini classification:", error);
     performanceMetrics.aiErrors++;
-  }
-  return classifyQuery(query);
-}
-
-async function classifyQueryDynamic(query) {
-  const geminiClassification = await classifyQueryWithGemini(query);
-  if (geminiClassification) {
-    return geminiClassification;
   }
   return classifyQuery(query);
 }
@@ -306,6 +416,196 @@ function classifyQuery(query) {
   classificationCache.set(cacheKey, result);
 
   return result;
+}
+
+async function generateGeminiResponse(prompt, queryClassification = null) {
+  const cacheKey = prompt + (queryClassification ? JSON.stringify(queryClassification) : '');
+  if (responseCache.has(cacheKey)) {
+    return responseCache.get(cacheKey);
+  }
+  if (!queryClassification) {
+    queryClassification = await classifyQueryDynamic(prompt);
+  }
+  if (queryClassification.category === "general_chat") {
+    const response = generateChatResponse(prompt, queryClassification);
+    return responseCache.set(cacheKey, response);
+  } else if (!queryClassification.isLegal) {
+    const response = handleNonLegalQuery(prompt, queryClassification);
+    return responseCache.set(cacheKey, response);
+  }
+
+  const startTime = Date.now();
+  performanceMetrics.aiCalls++;
+
+  const generateResponse = async (modPrompt, attempt = 1) => {
+    try {
+      const result = await withRetry(async () => await model.generateContent(modPrompt), 2);
+      const response = await result.response;
+      const endTime = Date.now();
+      const responseTime = endTime - startTime;
+
+      performanceMetrics.totalResponseTime += responseTime;
+      performanceMetrics.avgResponseTime = performanceMetrics.totalResponseTime / performanceMetrics.aiCalls;
+      performanceMetrics.maxResponseTime = Math.max(performanceMetrics.maxResponseTime, responseTime);
+      performanceMetrics.minResponseTime = Math.min(performanceMetrics.minResponseTime, responseTime);
+      performanceMetrics.responseTimes.push(responseTime);
+      if (performanceMetrics.responseTimes.length > 100) {
+        performanceMetrics.responseTimes.shift();
+      }
+
+      return response.text();
+    } catch (error) {
+      console.error(`AI response generation error (attempt ${attempt}):`, error);
+      performanceMetrics.aiErrors++;
+      throw error;
+    }
+  };
+
+  const optimizedPrompt = buildOptimizedPrompt(prompt, queryClassification);
+
+  try {
+    const responseText = await generateResponse(optimizedPrompt.mainPrompt, 1);
+    let processedResponse = responseText;
+    if (queryClassification.isEmergency || queryClassification.complexity >= 4) {
+      processedResponse = simplifyLegalTerms(responseText);
+    }
+    const formattedResponse = formatIndianLegalResponse(
+      processedResponse,
+      queryClassification.subCategory || "general",
+      queryClassification.sentiment
+    );
+
+    return responseCache.set(cacheKey, formattedResponse);
+  } catch (error) {
+    if (error.message?.includes("RECITATION") || error.message?.includes("BLOCKED")) {
+      try {
+        const fallbackResponse = await generateResponse(optimizedPrompt.fallbackPrompt, 2);
+        const formattedFallback = formatIndianLegalResponse(
+          fallbackResponse,
+          queryClassification.subCategory || "general",
+          queryClassification.sentiment
+        );
+        return responseCache.set(cacheKey, formattedFallback);
+      } catch (fallbackError) {
+        console.error("Both main and fallback prompts failed:", fallbackError);
+        return "I'm experiencing some difficulty providing a complete answer to your legal question. Could you please rephrase your query or ask about a specific aspect of this legal topic?";
+      }
+    }
+    return error.message?.includes("RECITATION")
+      ? "I'm sorry, I'm unable to generate a response due to restrictions on reciting pre-existing legal texts. Please ask a more specific question about your legal concern."
+      : "I'm sorry, I encountered an error processing your legal query. Please try rephrasing your question.";
+  }
+}
+
+function buildOptimizedPrompt(query, classification) {
+  const category = classification.subCategory || "general";
+  const sentiment = classification.sentiment;
+  const requestType = classification.requestType;
+  const complexity = classification.complexity || 1;
+  const specificLaws = classification.specificLaws || [];
+
+  let mainPrompt = `[SYSTEM: You are Juris, an expert legal assistant specializing in Indian law. Provide accurate, clear, and helpful information based on current Indian legal statutes, precedents, and practices. When relevant, cite specific laws, sections, or judgments. Avoid legal jargon when possible and explain complex terms. Structure your answers clearly with relevant headings and bullet points where appropriate. Your goal is to make Indian legal information accessible to citizens.]\n\n`;
+  mainPrompt += `[CONTEXT: The following question relates to ${category} law in India. The user's sentiment appears to be ${sentiment}. They seem to be requesting ${requestType} assistance. The query complexity is rated ${complexity}/5.`;
+
+  if (specificLaws.length > 0) {
+    mainPrompt += ` The query specifically mentions: ${specificLaws.join(", ")}.`;
+  }
+
+  mainPrompt += `]\n\n${query}`;
+  if (classification.isEmergency) {
+    mainPrompt = `[SYSTEM: This appears to be an URGENT legal situation. Prioritize immediate actionable steps and emergency resources in your response.]\n\n${mainPrompt}`;
+  }
+  if (classification.containsIndianLanguage) {
+    mainPrompt = `[SYSTEM: The query contains text in an Indian language. Try to understand the intent and respond in simple English with cultural sensitivity.]\n\n${mainPrompt}`;
+  }
+  const fallbackPrompt = mainPrompt + "\n\n[SYSTEM: Generate a completely original analysis. Do not quote any legal texts verbatim. Provide a synthesized explanation entirely in your own words, focusing on practical implications and general principles rather than specific statutory language.]";
+
+  return { mainPrompt, fallbackPrompt };
+}
+
+async function generateChatSummary(messages) {
+  if (!messages || messages.length === 0) {
+    return "No conversation to summarize";
+  }
+  const recentMessages = messages.slice(-10);
+
+  const chatText = recentMessages
+    .map((msg) => `${msg.type === "user" ? "User:" : "Bot:"} ${msg.text}`)
+    .join("\n");
+
+  const prompt = `Summarize this legal conversation in exactly 6 words:
+
+${chatText}`;
+
+  try {
+    let summary = await generateGeminiResponse(prompt, { isLegal: false, category: "general_chat" });
+    summary = summary.trim().replace(/[^a-zA-Z0-9\s]/g, "").replace(/\s+/g, " ");
+    const words = summary.split(" ").filter(word => word.length > 0).slice(0, 6);
+    return words.join(" ");
+  } catch (error) {
+    console.error("❌ Error generating chat summary:", error);
+    return "Summary unavailable";
+  }
+}
+
+async function processQuery(query) {
+  try {
+    const classification = await classifyQueryDynamic(query);
+    const response = await generateGeminiResponse(query, classification);
+    return {
+      response,
+      classification
+    };
+  } catch (error) {
+    console.error("Error in processQuery:", error);
+    return {
+      response: "I apologize, but I'm having trouble processing your request right now. Please try again in a moment.",
+      classification: {
+        isLegal: false,
+        category: "error",
+        confidence: 0
+      },
+      error: error.message
+    };
+  }
+}
+
+function getServiceMetrics() {
+  const now = Date.now();
+  let medianResponseTime = 0;
+  if (performanceMetrics.responseTimes.length > 0) {
+    const sortedTimes = [...performanceMetrics.responseTimes].sort((a, b) => a - b);
+    const midIndex = Math.floor(sortedTimes.length / 2);
+    medianResponseTime = sortedTimes.length % 2 === 0
+      ? (sortedTimes[midIndex - 1] + sortedTimes[midIndex]) / 2
+      : sortedTimes[midIndex];
+  }
+
+  return {
+    performance: {
+      ...performanceMetrics,
+      uptime: Math.floor((now - performanceMetrics.startTime) / 1000),
+      medianResponseTime,
+      p95ResponseTime: calculatePercentile(performanceMetrics.responseTimes, 95),
+      lastMinuteRequests: performanceMetrics.lastMinuteRequests.length,
+    },
+    caches: {
+      classification: classificationCache.getStats(),
+      response: responseCache.getStats(),
+      dynamicClassification: dynamicClassificationCache.getStats()
+    },
+    system: {
+      memory: process.memoryUsage(),
+      cpuUsage: process.cpuUsage()
+    }
+  };
+}
+
+function calculatePercentile(array, percentile) {
+  if (!array.length) return 0;
+  const sorted = [...array].sort((a, b) => a - b);
+  const index = Math.ceil((percentile / 100) * sorted.length) - 1;
+  return sorted[index];
 }
 
 function detectQuerySentiment(query) {
@@ -521,122 +821,12 @@ function redirectToLegalHelp(query, classification) {
   return "I'm specialized in providing information about Indian law and legal procedures. While I don't have enough context to address your current question, I'd be happy to help with any legal matters you might have. You could ask about rights, procedures, documents, or specific laws in India. How can I assist you with a legal concern today?";
 }
 
-async function generateGeminiResponse(prompt, queryClassification = null) {
-  const cacheKey = prompt + (queryClassification ? JSON.stringify(queryClassification) : '');
-  if (responseCache.has(cacheKey)) {
-    return responseCache.get(cacheKey);
+async function classifyQueryDynamic(query) {
+  const geminiClassification = await classifyQueryWithGemini(query);
+  if (geminiClassification) {
+    return geminiClassification;
   }
-
-  if (!queryClassification) {
-    queryClassification = await classifyQueryDynamic(prompt);
-  }
-
-  if (queryClassification.category === "general_chat") {
-    const response = generateChatResponse(prompt, queryClassification);
-    return responseCache.set(cacheKey, response);
-  } else if (!queryClassification.isLegal) {
-    const response = handleNonLegalQuery(prompt, queryClassification);
-    return responseCache.set(cacheKey, response);
-  }
-
-  const startTime = Date.now();
-  performanceMetrics.aiCalls++;
-
-  const attemptResponse = async (modPrompt) => {
-    try {
-      const result = await withRetry(async () => await model.generateContent(modPrompt), 2);
-      const response = await result.response;
-      const endTime = Date.now();
-      performanceMetrics.totalResponseTime += (endTime - startTime);
-      performanceMetrics.avgResponseTime = performanceMetrics.totalResponseTime / performanceMetrics.aiCalls;
-
-      return response.text();
-    } catch (error) {
-      console.error(`AI response generation error:`, error);
-      performanceMetrics.aiErrors++;
-      throw error;
-    }
-  };
-
-  const category = queryClassification.subCategory || "general";
-  const sentiment = queryClassification.sentiment;
-  const requestType = queryClassification.requestType;
-  const complexity = queryClassification.complexity || 1;
-  const specificLaws = queryClassification.specificLaws || [];
-
-  let enhancedPrompt = `[SYSTEM: You are Juris, an expert legal assistant specializing in Indian law. Provide accurate, clear, and helpful information based on current Indian legal statutes, precedents, and practices. When relevant, cite specific laws, sections, or judgments. Avoid legal jargon when possible and explain complex terms. Structure your answers clearly with relevant headings and bullet points where appropriate. Your goal is to make Indian legal information accessible to citizens.]\n\n`;
-
-  enhancedPrompt += `[CONTEXT: The following question relates to ${category} law in India. The user's sentiment appears to be ${sentiment}. They seem to be requesting ${requestType} assistance. The query complexity is rated ${complexity}/5.`;
-
-  if (specificLaws.length > 0) {
-    enhancedPrompt += ` The query specifically mentions: ${specificLaws.join(", ")}.`;
-  }
-
-  enhancedPrompt += `]\n\n${prompt}`;
-
-  if (queryClassification.isEmergency) {
-    enhancedPrompt = `[SYSTEM: This appears to be an URGENT legal situation. Prioritize immediate actionable steps and emergency resources in your response.]\n\n${enhancedPrompt}`;
-  }
-  if (queryClassification.containsIndianLanguage) {
-    enhancedPrompt = `[SYSTEM: The query contains text in an Indian language. Try to understand the intent and respond in simple English with cultural sensitivity.]\n\n${enhancedPrompt}`;
-  }
-
-  const promptAttempts = [
-    enhancedPrompt,
-    enhancedPrompt + "\n\n[SYSTEM: Generate a completely original analysis based on Indian law. Do not quote or recite any legal texts or excerpts verbatim. Provide a precise, synthesized explanation entirely in your own words.]",
-    enhancedPrompt + "\n\n[SYSTEM: DO NOT include any verbatim legal text. Synthesize a fully original and accurate explanation by summarizing the Indian legal principles in your own words without reciting any existing legal material. Focus on practical guidance for Indian citizens.]"
-  ];
-
-  let lastError = null;
-  for (const attemptPrompt of promptAttempts) {
-    try {
-      const responseText = await attemptResponse(attemptPrompt);
-      let processedResponse = responseText;
-
-      if (queryClassification.isEmergency || complexity >= 4) {
-        processedResponse = simplifyLegalTerms(responseText);
-      }
-
-      const formattedResponse = formatIndianLegalResponse(processedResponse, category, sentiment);
-      return responseCache.set(cacheKey, formattedResponse);
-    } catch (error) {
-      console.error(`❌ Error in prompt attempt:`, error);
-      lastError = error;
-      if (!(error.message && error.message.includes("RECITATION"))) {
-        break;
-      }
-    }
-  }
-
-  return lastError && lastError.message?.includes("RECITATION")
-    ? "I'm sorry, I'm unable to generate a response due to restrictions on reciting pre-existing legal texts. Please ask a more specific question about your legal concern."
-    : "I'm sorry, I encountered an error processing your legal query. Please try rephrasing your question.";
-}
-
-async function generateChatSummary(messages) {
-  if (!messages || messages.length === 0) {
-    return "No conversation to summarize";
-  }
-
-  const chatText = messages
-    .map((msg) => `${msg.type === "user" ? "User:" : "Bot:"} ${msg.text}`)
-    .join("\n");
-
-  const prompt = `Write a concise, highly accurate summary of the following chat conversation in exactly 6 words. Each word must be essential and there should be no extra text or punctuation beyond the six words.
-
-Chat Conversation:
-${chatText}`;
-
-  try {
-    let summary = await generateGeminiResponse(prompt, { isLegal: false, category: "general_chat" });
-
-    summary = summary.trim().replace(/[^a-zA-Z0-9\s]/g, "").replace(/\s+/g, " ");
-    const words = summary.split(" ").filter(word => word.length > 0).slice(0, 6);
-    return words.join(" ");
-  } catch (error) {
-    console.error("❌ Error generating chat summary:", error);
-    return "Summary unavailable";
-  }
+  return classifyQuery(query);
 }
 
 function containsIndianLanguage(query) {
@@ -708,29 +898,6 @@ function getEmergencyLegalResources() {
   return emergencyResourcesCache;
 }
 
-async function processQuery(query) {
-  const classification = await classifyQueryDynamic(query);
-  const response = await generateGeminiResponse(query, classification);
-  return {
-    response,
-    classification
-  };
-}
-
-function getServiceMetrics() {
-  return {
-    performance: {
-      ...performanceMetrics,
-      uptime: Math.floor((Date.now() - performanceMetrics.startTime) / 1000),
-    },
-    caches: {
-      classification: classificationCache.getStats(),
-      response: responseCache.getStats(),
-      dynamicClassification: dynamicClassificationCache.getStats()
-    }
-  };
-}
-
 module.exports = {
   isLegalQuery,
   generateGeminiResponse,
@@ -747,5 +914,6 @@ module.exports = {
   classifyQueryDynamic,
   processQuery,
   getServiceMetrics,
-  withRetry
+  withRetry,
+  batchProcessQueries
 };

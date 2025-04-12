@@ -3,53 +3,139 @@ const Chat = require("../models/Chat");
 const { v4: uuidv4 } = require("uuid");
 const { encryptText, decryptText } = require("../utils/encryption");
 const {
+  generateGeminiResponse,
   generateChatSummary,
   processQuery,
   getServiceMetrics,
-  withRetry
+  withRetry,
+  batchProcessQueries
 } = require("../services/aiService");
 
-const chatCache = new Map();
-const CHAT_CACHE_SIZE = 100;
-const CHAT_CACHE_TTL = 15 * 60 * 1000;
+class LRUCache {
+  constructor(maxSize = 100, ttlMs = 15 * 60 * 1000) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+    this.ttlMs = ttlMs;
+    this.stats = { hits: 0, misses: 0, evictions: 0 };
+  }
 
+  get(key) {
+    if (!this.cache.has(key)) {
+      this.stats.misses++;
+      return null;
+    }
+
+    const item = this.cache.get(key);
+    if (Date.now() > item.expiry) {
+      this.cache.delete(key);
+      this.stats.evictions++;
+      return null;
+    }
+    this.cache.delete(key);
+    this.cache.set(key, item);
+    this.stats.hits++;
+    return item.value;
+  }
+
+  set(key, value) {
+    if (this.cache.size >= this.maxSize) {
+      const oldestKey = this.cache.keys().next().value;
+      this.cache.delete(oldestKey);
+      this.stats.evictions++;
+    }
+
+    this.cache.set(key, {
+      value,
+      expiry: Date.now() + this.ttlMs
+    });
+    return value;
+  }
+
+  delete(key) {
+    return this.cache.delete(key);
+  }
+
+  has(key) {
+    if (!this.cache.has(key)) return false;
+    const item = this.cache.get(key);
+    if (Date.now() > item.expiry) {
+      this.cache.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  keys() {
+    return this.cache.keys();
+  }
+
+  get size() {
+    return this.cache.size;
+  }
+
+  getStats() {
+    return {
+      ...this.stats,
+      size: this.cache.size,
+      hitRate: this.stats.hits + this.stats.misses > 0
+        ? (this.stats.hits / (this.stats.hits + this.stats.misses)) * 100
+        : 0
+    };
+  }
+}
+
+const chatCache = new LRUCache(100, 15 * 60 * 1000);
 const handleError = (res, error, message, statusCode = 500) => {
-  console.error(`❌ ${message}:`, error);
+  const errorType = error.name || 'GeneralError';
+  const errorId = uuidv4().substring(0, 8);
+
+  console.error(`❌ [${errorId}] ${message} (${errorType}):`, error);
+  if (error.name === 'AIServiceError') {
+    statusCode = 503;
+    message = 'AI service temporarily unavailable';
+  } else if (error.name === 'ValidationError') {
+    statusCode = 400;
+  } else if (error.name === 'AuthorizationError') {
+    statusCode = 403;
+  }
+
   return res.status(statusCode).json({
     message,
-    error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    errorId,
+    errorType: process.env.NODE_ENV === 'development' ? errorType : undefined,
+    errorDetails: process.env.NODE_ENV === 'development' ? error.message : undefined
   });
 };
 
 const getCachedChat = (userId, chatId) => {
   const key = `${userId}:${chatId}`;
-  const cached = chatCache.get(key);
-  if (cached && Date.now() - cached.timestamp < CHAT_CACHE_TTL) {
-    return cached.data;
-  }
-  chatCache.delete(key);
-  return null;
+  return chatCache.get(key);
 };
 
 const setCachedChat = (userId, chatId, data) => {
   const key = `${userId}:${chatId}`;
-  if (chatCache.size >= CHAT_CACHE_SIZE) {
-    const oldestKey = chatCache.keys().next().value;
-    chatCache.delete(oldestKey);
-  }
-  chatCache.set(key, {
-    data,
-    timestamp: Date.now()
-  });
-  return data;
+  return chatCache.set(key, data);
 };
 
 const invalidateUserChatCache = (userId) => {
-  for (const [key] of chatCache) {
+  for (const key of chatCache.keys()) {
     if (key.startsWith(`${userId}:`)) {
       chatCache.delete(key);
     }
   }
+};
+
+const batchDecryptMessages = (messages) => {
+  if (!messages || !messages.length) return [];
+
+  return messages.map(m => ({
+    ...m.toObject ? m.toObject() : m,
+    text: typeof m.text === 'string' ? decryptText(m.text) : m.text
+  }));
 };
 
 exports.processChat = async (req, res) => {
@@ -61,7 +147,7 @@ exports.processChat = async (req, res) => {
       return res.status(400).json({ message: "Message is required and cannot be empty" });
     }
     const { response: botResponse, classification: queryClassification } =
-      await withRetry(() => processQuery(message), 2);
+      await withRetry(() => processQuery(message), 3, 1000, true);
 
     const currentTime = new Date();
     const userMessagePlain = { type: "user", text: message, time: currentTime };
@@ -71,7 +157,8 @@ exports.processChat = async (req, res) => {
     if (chatId) {
       chat = getCachedChat(userId, chatId);
       if (!chat) {
-        chat = await Chat.findOne({ userId, chatId });
+        chat = await Chat.findOne({ userId, chatId })
+          .maxTimeMS(5000);
       }
     }
 
@@ -80,11 +167,7 @@ exports.processChat = async (req, res) => {
 
     if (chat) {
       if (chat.messages) {
-        plainMessagesForSummary = chat.messages.map(m => ({
-          type: m.type,
-          text: typeof m.text === 'string' ? decryptText(m.text) : m.text,
-          time: m.time
-        }));
+        plainMessagesForSummary = batchDecryptMessages(chat.messages);
         messageCount = chat.messages.length;
       } else {
         plainMessagesForSummary = [];
@@ -108,25 +191,14 @@ exports.processChat = async (req, res) => {
     }
 
     if (!chat.title || chat.title === "New Chat") {
-      if (queryClassification.isLegal) {
-        const titleMatch = botResponse.match(/\*\*Title:\*\*\s*(.*?)(?:\n|$)/i) ||
-          botResponse.match(/^Title:\s*(.*?)(?:\n|$)/i);
-        if (titleMatch && titleMatch[1]) {
-          chat.title = titleMatch[1].trim().substring(0, 100);
-        } else if (queryClassification.specificLaws && queryClassification.specificLaws.length > 0) {
-          chat.title = `Query about ${queryClassification.specificLaws[0]}`;
-        } else {
-          chat.title = `${queryClassification.subCategory || 'Legal'} Query`;
-        }
-      } else {
-        chat.title = queryClassification.category === "general_chat"
-          ? "General Conversation"
-          : `${queryClassification.category.replace(/_/g, ' ')} Query`;
-      }
+      chat.title = await generateChatTitle(botResponse, queryClassification, message);
+    }
+    let summaryPlain = "";
+    if (plainMessagesForSummary.length >= 4) {
+      summaryPlain = await generateChatSummary(plainMessagesForSummary);
+      chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
     }
 
-    const summaryPlain = await generateChatSummary(plainMessagesForSummary);
-    chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
     await chat.save();
 
     invalidateUserChatCache(userId);
@@ -148,6 +220,31 @@ exports.processChat = async (req, res) => {
   }
 };
 
+async function generateChatTitle(botResponse, classification, query) {
+  if (classification.isLegal) {
+    const titleMatch = botResponse.match(/\*\*Title:\*\*\s*(.*?)(?:\n|$)/i) ||
+      botResponse.match(/^Title:\s*(.*?)(?:\n|$)/i);
+
+    if (titleMatch && titleMatch[1]) {
+      return titleMatch[1].trim().substring(0, 100);
+    }
+
+    if (classification.specificLaws && classification.specificLaws.length > 0) {
+      return `Query about ${classification.specificLaws[0]}`;
+    }
+
+    return `${classification.subCategory || 'Legal'} Query`;
+  }
+
+  if (query.length <= 50) {
+    return query;
+  }
+
+  return classification.category === "general_chat"
+    ? "General Conversation"
+    : `${classification.category.replace(/_/g, ' ')} Query`;
+}
+
 exports.getAllChats = async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -159,16 +256,19 @@ exports.getAllChats = async (req, res) => {
       .sort({ updatedAt: -1 })
       .skip(skip)
       .limit(limit)
-      .select('chatId title chatSummary createdAt updatedAt messages')
-      .maxTimeMS(30000);
+      .select('chatId title chatSummary createdAt updatedAt messages.time')
+      .lean()
+      .maxTimeMS(5000);
 
-    const formattedChats = chats
+    const formattedChats = await Promise.all(chats
       .filter(chat => chat.messages && chat.messages.length > 0)
-      .map(chat => {
+      .map(async chat => {
         const chatItem = {
           chatId: chat.chatId,
           title: chat.title,
           messageCount: chat.messages.length,
+          lastMessageTime: chat.messages.length > 0 ?
+            chat.messages[chat.messages.length - 1].time : null,
           createdAt: chat.createdAt,
           updatedAt: chat.updatedAt
         };
@@ -183,14 +283,24 @@ exports.getAllChats = async (req, res) => {
         }
 
         return chatItem;
-      });
+      }));
 
-    formattedChats.forEach(chat => {
-      const fullChat = chats.find(c => c.chatId === chat.chatId);
-      if (fullChat) {
-        setCachedChat(userId, chat.chatId, fullChat);
+    setTimeout(async () => {
+      try {
+        const fullChats = await Chat.find({
+          userId,
+          chatId: { $in: formattedChats.map(c => c.chatId) }
+        }).maxTimeMS(10000);
+
+        fullChats.forEach(chat => {
+          setCachedChat(userId, chat.chatId, chat);
+        });
+      } catch (error) {
+        console.error("Background caching error:", error);
       }
-    });
+    }, 0);
+    const totalDocs = await Chat.countDocuments({ userId })
+      .maxTimeMS(3000);
 
     res.json({
       chats: formattedChats,
@@ -198,8 +308,10 @@ exports.getAllChats = async (req, res) => {
         page,
         limit,
         hasMore: chats.length === limit,
-        totalPages: Math.ceil(await Chat.countDocuments({ userId }) / limit)
-      }
+        totalPages: Math.ceil(totalDocs / limit),
+        totalChats: totalDocs
+      },
+      cacheStats: chatCache.getStats()
     });
   } catch (error) {
     return handleError(res, error, "Error fetching all chats");
@@ -405,10 +517,7 @@ exports.getServiceStatus = async (req, res) => {
     res.json({
       status: "operational",
       cacheStatus: {
-        chatCache: {
-          size: chatCache.size,
-          maxSize: CHAT_CACHE_SIZE
-        },
+        chatCache: chatCache.getStats(),
         ...metrics.caches
       },
       performance: metrics.performance,
