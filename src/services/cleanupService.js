@@ -1,20 +1,38 @@
 // src/services/cleanupService.js
 const Chat = require("../models/Chat");
 
-const cleanupEmptyChats = async () => {
-    try {
-        console.log("🧹 Running empty chat cleanup...");
-        const result = await Chat.deleteMany({
-            "messages": { $size: 0 }
-        });
-        if (result.deletedCount > 0) {
-            console.log(`🧹 Cleanup completed: Removed ${result.deletedCount} empty chats`);
-        } else {
-            console.log("🧹 No empty chats to clean up");
+const cleanupEmptyChats = async (retries = 3, delay = 5000) => {
+    let attempts = 0;
+
+    const executeCleanup = async () => {
+        attempts++;
+        try {
+            console.log(`🧹 Running empty chat cleanup (attempt ${attempts}/${retries + 1})...`);
+            const result = await Chat.deleteMany({
+                "messages": { $size: 0 }
+            }).maxTimeMS(30000);
+
+            if (result.deletedCount > 0) {
+                console.log(`🧹 Cleanup completed: Removed ${result.deletedCount} empty chats`);
+            } else {
+                console.log("🧹 No empty chats to clean up");
+            }
+
+            return true;
+        } catch (error) {
+            console.error(`❌ Error during chat cleanup (attempt ${attempts}/${retries + 1}):`, error);
+            if (attempts <= retries &&
+                (error.name === 'MongooseError' || error.message.includes('timed out'))) {
+                console.log(`⏱️ Retrying in ${delay / 1000} seconds...`);
+                return new Promise(resolve => setTimeout(() => resolve(executeCleanup()), delay));
+            }
+
+            console.error(error);
+            return false;
         }
-    } catch (error) {
-        console.error("❌ Error during chat cleanup:", error);
-    }
+    };
+
+    return executeCleanup();
 };
 
 const startCleanupInterval = (intervalMinutes = 60) => {
