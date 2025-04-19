@@ -215,8 +215,16 @@ async function withRetry(fn, maxRetries = MAX_RETRIES, initialDelay = RETRY_DELA
       console.error(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
       lastError = error;
       performanceMetrics.retries++;
+      const isConnectionError = error.code === 'ECONNRESET' ||
+        error.code === 'ENOTFOUND' ||
+        error.code === 'ECONNREFUSED' ||
+        error.message.includes('fetch failed');
 
-      if (error.message.includes('timed out')) {
+      if (isConnectionError) {
+        console.warn(`Network connection error (${error.code || 'fetch failed'}). Will retry with exponential backoff.`);
+        const networkBackoff = initialDelay * Math.pow(3, attempt - 1);
+        await new Promise(resolve => setTimeout(resolve, networkBackoff));
+      } else if (error.message.includes('timed out')) {
         performanceMetrics.timeouts++;
       }
 
@@ -235,14 +243,54 @@ async function withRetry(fn, maxRetries = MAX_RETRIES, initialDelay = RETRY_DELA
   }
 
   return {
-    response: "I'm sorry, I'm having trouble processing your request right now. Please try again in a moment.",
+    response: "I'm sorry, I'm having trouble connecting to our knowledge services right now. Please try again in a moment.",
     classification: {
       isLegal: false,
-      category: "error",
+      category: "connection_error",
       confidence: 0
     },
-    error: lastError
+    error: lastError?.message || "Connection error"
   };
+}
+
+const connectionHealth = {
+  lastSuccessful: Date.now(),
+  consecutiveErrors: 0,
+  totalErrors: 0,
+  errorTypes: {},
+  isStable: true
+};
+
+async function checkConnectionHealth() {
+  try {
+    if (!geminiApiStatus.isAvailable) {
+      return false;
+    }
+    await fetch('https://generativelanguage.googleapis.com/v1/models', {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(5000)
+    });
+
+    connectionHealth.lastSuccessful = Date.now();
+    connectionHealth.consecutiveErrors = 0;
+    connectionHealth.isStable = true;
+    return true;
+  } catch (error) {
+    connectionHealth.consecutiveErrors++;
+    connectionHealth.totalErrors++;
+    const errorType = error.code || (error.message.includes('fetch failed') ? 'FETCH_FAILED' : 'UNKNOWN');
+    connectionHealth.errorTypes[errorType] = (connectionHealth.errorTypes[errorType] || 0) + 1;
+
+    if (connectionHealth.consecutiveErrors >= 3) {
+      connectionHealth.isStable = false;
+    }
+
+    console.error(`Connection health check failed: ${error.message} (${errorType}). Consecutive errors: ${connectionHealth.consecutiveErrors}`);
+    return false;
+  }
 }
 
 async function batchProcessQueries(queries) {
@@ -299,7 +347,20 @@ For specificLaws: Identify specific Indian laws, acts, or sections mentioned (em
       return await model.generateContent(classificationPrompt);
     }, 2);
 
-    const responseText = await result.response.text();
+    let responseText;
+    if (result.response && result.response.text) {
+      responseText = await result.response.text();
+    } else if (result.response && result.response.candidates && result.response.candidates[0]) {
+      responseText = result.response.candidates[0].content.parts[0].text;
+    } else if (result.text) {
+      responseText = result.text();
+    } else if (typeof result.response === 'string') {
+      responseText = result.response;
+    } else {
+      console.error("Unexpected response format:", JSON.stringify(result));
+      throw new Error("Unexpected response format from AI service");
+    }
+
     let extractedJson = responseText.trim();
     const endTime = Date.now();
     const responseTime = endTime - startTime;
@@ -343,7 +404,7 @@ For specificLaws: Identify specific Indian laws, acts, or sections mentioned (em
       }
     }
   } catch (error) {
-    console.error("Error in Gemini classification:", error);
+    console.error("Error in Gemini classification:", error, "Response structure:", error.response ? JSON.stringify(Object.keys(error.response)) : "No response object");
     performanceMetrics.aiErrors++;
   }
   return classifyQuery(query);
@@ -440,7 +501,7 @@ async function generateGeminiResponse(prompt, queryClassification = null) {
   const generateResponse = async (modPrompt, attempt = 1) => {
     try {
       const result = await withRetry(async () => await model.generateContent(modPrompt), 2);
-      const response = await result.response;
+      const response = result.response;
       const endTime = Date.now();
       const responseTime = endTime - startTime;
 
@@ -453,9 +514,21 @@ async function generateGeminiResponse(prompt, queryClassification = null) {
         performanceMetrics.responseTimes.shift();
       }
 
-      return response.text();
+      if (response && response.text && typeof response.text === 'function') {
+        return response.text();
+      } else if (response && response.candidates && response.candidates[0]) {
+        return response.candidates[0].content.parts[0].text;
+      } else if (result.text && typeof result.text === 'function') {
+        return result.text();
+      } else if (typeof response === 'string') {
+        return response;
+      } else {
+        console.error("Unexpected response format:", JSON.stringify(response));
+        throw new Error("Unexpected response format from AI service");
+      }
     } catch (error) {
-      console.error(`AI response generation error (attempt ${attempt}):`, error);
+      console.error(`AI response generation error (attempt ${attempt}):`, error,
+        "Response structure:", error.response ? JSON.stringify(Object.keys(error.response)) : "No response object");
       performanceMetrics.aiErrors++;
       throw error;
     }
@@ -543,21 +616,114 @@ ${chatText}`;
     const words = summary.split(" ").filter(word => word.length > 0).slice(0, 6);
     return words.join(" ");
   } catch (error) {
-    console.error("❌ Error generating chat summary:", error);
+    console.error("❌ Error generating chat summary:", error,
+      "Response structure:", error.response ? JSON.stringify(Object.keys(error.response)) : "No response object");
     return "Summary unavailable";
   }
 }
 
+let geminiApiStatus = {
+  isAvailable: true,
+  lastCheck: Date.now(),
+  consecutiveFailures: 0,
+  retryAfter: 60000
+};
+
+async function checkGeminiApiStatus() {
+  const now = Date.now();
+  if (!geminiApiStatus.isAvailable && (now - geminiApiStatus.lastCheck) < 30000) {
+    return false;
+  }
+
+  try {
+    await model.generateContent("Hello");
+    geminiApiStatus.isAvailable = true;
+    geminiApiStatus.consecutiveFailures = 0;
+    geminiApiStatus.lastCheck = now;
+    return true;
+  } catch (error) {
+    geminiApiStatus.isAvailable = false;
+    geminiApiStatus.lastCheck = now;
+    geminiApiStatus.consecutiveFailures++;
+    geminiApiStatus.retryAfter = Math.min(300000, 60000 * Math.pow(1.5, geminiApiStatus.consecutiveFailures - 1));
+
+    console.error(`Gemini API unavailable (failure #${geminiApiStatus.consecutiveFailures}). Will retry after ${geminiApiStatus.retryAfter / 1000} seconds`);
+    return false;
+  }
+}
+
+function getUnavailableServiceResponse() {
+  return {
+    response: "I'm sorry, our AI service is temporarily unavailable. We're working to restore service as quickly as possible. Basic functionality is still available, but responses may be limited. Please try again later.",
+    classification: {
+      isLegal: false,
+      category: "service_unavailable",
+      confidence: 1.0
+    }
+  };
+}
+
 async function processQuery(query) {
   try {
-    const classification = await classifyQueryDynamic(query);
-    const response = await generateGeminiResponse(query, classification);
-    return {
-      response,
-      classification
-    };
+    if (connectionHealth.consecutiveErrors > 0) {
+      await checkConnectionHealth();
+    }
+
+    const basicClassification = classifyQuery(query);
+    if (!connectionHealth.isStable || !geminiApiStatus.isAvailable) {
+      if (basicClassification.category === "general_chat" || !basicClassification.isLegal) {
+        return {
+          response: handleNonLegalQuery(query, basicClassification),
+          classification: basicClassification,
+          fromCache: true
+        };
+      }
+      return getUnavailableServiceResponse();
+    }
+    try {
+      const classification = await classifyQueryDynamic(query);
+      const response = await generateGeminiResponse(query, classification);
+      if (connectionHealth.consecutiveErrors > 0) {
+        connectionHealth.consecutiveErrors = 0;
+        connectionHealth.isStable = true;
+      }
+      return {
+        response,
+        classification
+      };
+    } catch (error) {
+      console.error("Error in AI processing:", error);
+      if (error.code === 'ECONNRESET' ||
+        error.code === 'ENOTFOUND' ||
+        error.code === 'ECONNREFUSED' ||
+        error.message?.includes("fetch failed") ||
+        error.message?.includes("network") ||
+        error.message?.includes("timeout")) {
+        connectionHealth.consecutiveErrors++;
+        connectionHealth.totalErrors++;
+        const errorType = error.code || (error.message.includes('fetch failed') ? 'FETCH_FAILED' : 'UNKNOWN');
+        connectionHealth.errorTypes[errorType] = (connectionHealth.errorTypes[errorType] || 0) + 1;
+
+        if (connectionHealth.consecutiveErrors >= 3) {
+          connectionHealth.isStable = false;
+        }
+        await checkGeminiApiStatus();
+        return {
+          response: "I'm experiencing connectivity issues right now. Please try again shortly while we resolve this technical problem.",
+          classification: basicClassification,
+          error: `Connection error: ${errorType}`,
+          connectionIssue: true
+        };
+      }
+
+      return {
+        response: "I apologize, but I'm having trouble processing your request right now. Please try again in a moment.",
+        classification: basicClassification,
+        error: error.message
+      };
+    }
   } catch (error) {
-    console.error("Error in processQuery:", error);
+    console.error("Critical error in processQuery:", error);
     return {
       response: "I apologize, but I'm having trouble processing your request right now. Please try again in a moment.",
       classification: {
@@ -593,6 +759,15 @@ function getServiceMetrics() {
       classification: classificationCache.getStats(),
       response: responseCache.getStats(),
       dynamicClassification: dynamicClassificationCache.getStats()
+    },
+    api: {
+      available: geminiApiStatus.isAvailable,
+      lastCheck: geminiApiStatus.lastCheck,
+      consecutiveFailures: geminiApiStatus.consecutiveFailures,
+      connectionHealth: {
+        ...connectionHealth,
+        timeSinceLastSuccess: now - connectionHealth.lastSuccessful
+      }
     },
     system: {
       memory: process.memoryUsage(),
@@ -915,5 +1090,8 @@ module.exports = {
   processQuery,
   getServiceMetrics,
   withRetry,
-  batchProcessQueries
+  batchProcessQueries,
+  checkGeminiApiStatus,
+  getUnavailableServiceResponse,
+  checkConnectionHealth
 };

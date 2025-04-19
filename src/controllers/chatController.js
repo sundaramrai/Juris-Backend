@@ -10,6 +10,7 @@ const {
   withRetry,
   batchProcessQueries
 } = require("../services/aiService");
+const lockManager = require('../utils/lockManager');
 
 class LRUCache {
   constructor(maxSize = 100, ttlMs = 15 * 60 * 1000) {
@@ -199,7 +200,14 @@ exports.processChat = async (req, res) => {
       chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
     }
 
-    await chat.save();
+    await lockManager.withLock(chat._id.toString(), async () => {
+      const freshChat = await Chat.findById(chat._id);
+      if (freshChat) {
+        freshChat.messages = chat.messages;
+        freshChat.lastActivity = chat.lastActivity;
+        await freshChat.save();
+      }
+    });
 
     invalidateUserChatCache(userId);
     setCachedChat(userId, chat.chatId, chat);
@@ -428,7 +436,10 @@ exports.createNewChat = async (req, res) => {
       messages: []
     });
 
-    await newChat.save();
+    await lockManager.withLock(newChat._id.toString(), async () => {
+      await newChat.save();
+    });
+
     res.json({
       chatId: newChat.chatId,
       title: newChat.title,
