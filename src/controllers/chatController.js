@@ -8,7 +8,8 @@ const {
   processQuery,
   getServiceMetrics,
   withRetry,
-  batchProcessQueries
+  batchProcessQueries,
+  prioritizeQuery
 } = require("../services/aiService");
 const lockManager = require('../utils/lockManager');
 
@@ -18,49 +19,63 @@ class LRUCache {
     this.maxSize = maxSize;
     this.ttlMs = ttlMs;
     this.stats = { hits: 0, misses: 0, evictions: 0 };
+    this.accessFrequency = new Map();
+    this.lastCleanup = Date.now();
+    this.cleanupInterval = 5 * 60 * 1000;
   }
 
   get(key) {
+    const now = Date.now();
+    this._checkCleanup(now);
     if (!this.cache.has(key)) {
       this.stats.misses++;
       return null;
     }
 
     const item = this.cache.get(key);
-    if (Date.now() > item.expiry) {
+    if (now > item.expiry) {
       this.cache.delete(key);
+      this.accessFrequency.delete(key);
       this.stats.evictions++;
       return null;
     }
-    this.cache.delete(key);
-    this.cache.set(key, item);
+    this.accessFrequency.set(key, (this.accessFrequency.get(key) || 0) + 1);
+    item.expiry = now + this.ttlMs;
     this.stats.hits++;
     return item.value;
   }
 
   set(key, value) {
+    const now = Date.now();
+    this._checkCleanup(now);
+
     if (this.cache.size >= this.maxSize) {
-      const oldestKey = this.cache.keys().next().value;
-      this.cache.delete(oldestKey);
-      this.stats.evictions++;
+      this._evictLeastUsed();
     }
 
     this.cache.set(key, {
       value,
-      expiry: Date.now() + this.ttlMs
+      expiry: now + this.ttlMs
     });
+    this.accessFrequency.set(key, 1);
     return value;
   }
 
   delete(key) {
+    this.accessFrequency.delete(key);
     return this.cache.delete(key);
   }
 
   has(key) {
+    const now = Date.now();
+    this._checkCleanup(now);
+
     if (!this.cache.has(key)) return false;
     const item = this.cache.get(key);
-    if (Date.now() > item.expiry) {
+    if (now > item.expiry) {
       this.cache.delete(key);
+      this.accessFrequency.delete(key);
+      this.stats.evictions++;
       return false;
     }
     return true;
@@ -68,6 +83,7 @@ class LRUCache {
 
   clear() {
     this.cache.clear();
+    this.accessFrequency.clear();
   }
 
   keys() {
@@ -84,8 +100,60 @@ class LRUCache {
       size: this.cache.size,
       hitRate: this.stats.hits + this.stats.misses > 0
         ? (this.stats.hits / (this.stats.hits + this.stats.misses)) * 100
-        : 0
+        : 0,
+      memoryEstimate: this._estimateMemoryUsage()
     };
+  }
+
+  _evictLeastUsed() {
+    let leastUsedKey = null;
+    let lowestFrequency = Infinity;
+
+    for (const [key, frequency] of this.accessFrequency.entries()) {
+      if (frequency < lowestFrequency && this.cache.has(key)) {
+        lowestFrequency = frequency;
+        leastUsedKey = key;
+      }
+    }
+
+    if (leastUsedKey) {
+      this.cache.delete(leastUsedKey);
+      this.accessFrequency.delete(leastUsedKey);
+      this.stats.evictions++;
+    } else {
+      const oldestKey = this.cache.keys().next().value;
+      this.cache.delete(oldestKey);
+      this.accessFrequency.delete(oldestKey);
+      this.stats.evictions++;
+    }
+  }
+
+  _checkCleanup(now) {
+    if (now - this.lastCleanup > this.cleanupInterval) {
+      this._cleanup(now);
+      this.lastCleanup = now;
+    }
+  }
+
+  _cleanup(now) {
+    const expiredKeys = [];
+
+    for (const [key, item] of this.cache.entries()) {
+      if (now > item.expiry) {
+        expiredKeys.push(key);
+      }
+    }
+
+    expiredKeys.forEach(key => {
+      this.cache.delete(key);
+      this.accessFrequency.delete(key);
+      this.stats.evictions++;
+    });
+  }
+
+  _estimateMemoryUsage() {
+    const entrySize = 200;
+    return Math.round((this.cache.size * entrySize) / 1024);
   }
 }
 
@@ -132,11 +200,19 @@ const invalidateUserChatCache = (userId) => {
 
 const batchDecryptMessages = (messages) => {
   if (!messages || !messages.length) return [];
+  const batchSize = 50;
+  const results = [];
 
-  return messages.map(m => ({
-    ...m.toObject ? m.toObject() : m,
-    text: typeof m.text === 'string' ? decryptText(m.text) : m.text
-  }));
+  for (let i = 0; i < messages.length; i += batchSize) {
+    const batch = messages.slice(i, i + batchSize);
+    const decryptedBatch = batch.map(m => ({
+      ...m.toObject ? m.toObject() : m,
+      text: typeof m.text === 'string' ? decryptText(m.text) : m.text
+    }));
+    results.push(...decryptedBatch);
+  }
+
+  return results;
 };
 
 exports.processChat = async (req, res) => {
@@ -147,12 +223,28 @@ exports.processChat = async (req, res) => {
     if (!message || message.trim() === '') {
       return res.status(400).json({ message: "Message is required and cannot be empty" });
     }
+    const priority = message.length < 200 ? await prioritizeQuery(message) : 'normal';
+
+    const processingStart = Date.now();
     const { response: botResponse, classification: queryClassification } =
       await withRetry(() => processQuery(message), 3, 1000, true);
+    const processingTime = Date.now() - processingStart;
 
     const currentTime = new Date();
     const userMessagePlain = { type: "user", text: message, time: currentTime };
-    const botMessagePlain = { type: "bot", text: botResponse, time: currentTime };
+    const botMessagePlain = {
+      type: "bot",
+      text: botResponse,
+      time: currentTime,
+      metadata: {
+        processingTime,
+        classification: {
+          category: queryClassification.category,
+          isLegal: queryClassification.isLegal,
+          priority
+        }
+      }
+    };
 
     let chat;
     if (chatId) {
@@ -177,7 +269,7 @@ exports.processChat = async (req, res) => {
 
       plainMessagesForSummary.push(userMessagePlain, botMessagePlain);
       chat.messages.push({ type: "user", text: encryptText(message), time: currentTime });
-      chat.messages.push({ type: "bot", text: encryptText(botResponse), time: currentTime });
+      chat.messages.push({ type: "bot", text: encryptText(botResponse), time: currentTime, metadata: botMessagePlain.metadata });
     } else {
       const newChatId = chatId || uuidv4();
       plainMessagesForSummary = [userMessagePlain, botMessagePlain];
@@ -186,7 +278,7 @@ exports.processChat = async (req, res) => {
         chatId: newChatId,
         messages: [
           { type: "user", text: encryptText(message), time: currentTime },
-          { type: "bot", text: encryptText(botResponse), time: currentTime }
+          { type: "bot", text: encryptText(botResponse), time: currentTime, metadata: botMessagePlain.metadata }
         ]
       });
     }
@@ -199,12 +291,13 @@ exports.processChat = async (req, res) => {
       summaryPlain = await generateChatSummary(plainMessagesForSummary);
       chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
     }
-
-    await lockManager.withLock(chat._id.toString(), async () => {
+    const chatSavePromise = lockManager.withLock(chat._id.toString(), async () => {
       const freshChat = await Chat.findById(chat._id);
       if (freshChat) {
         freshChat.messages = chat.messages;
         freshChat.lastActivity = chat.lastActivity;
+        freshChat.chatSummary = chat.chatSummary;
+        freshChat.title = chat.title;
         await freshChat.save();
       }
     });
@@ -221,8 +314,10 @@ exports.processChat = async (req, res) => {
       category: queryClassification.category,
       isLegal: queryClassification.isLegal,
       messageCount: messageCount + 2,
-      complexity: queryClassification.complexity || 1
+      complexity: queryClassification.complexity || 1,
+      processingTime
     });
+    await chatSavePromise;
   } catch (error) {
     return handleError(res, error, "Error processing chat");
   }
@@ -260,7 +355,17 @@ exports.getAllChats = async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
 
-    const chats = await Chat.find({ userId })
+    const filter = { userId };
+
+    if (req.query.startDate) {
+      filter.updatedAt = { $gte: new Date(req.query.startDate) };
+    }
+
+    if (req.query.keyword) {
+      filter.title = { $regex: req.query.keyword, $options: 'i' };
+    }
+
+    const chats = await Chat.find(filter)
       .sort({ updatedAt: -1 })
       .skip(skip)
       .limit(limit)
@@ -293,21 +398,41 @@ exports.getAllChats = async (req, res) => {
         return chatItem;
       }));
 
+    const cacheBatchSize = 5;
     setTimeout(async () => {
       try {
+        const chatIds = formattedChats.slice(0, cacheBatchSize).map(c => c.chatId);
         const fullChats = await Chat.find({
           userId,
-          chatId: { $in: formattedChats.map(c => c.chatId) }
+          chatId: { $in: chatIds }
         }).maxTimeMS(10000);
 
         fullChats.forEach(chat => {
           setCachedChat(userId, chat.chatId, chat);
         });
+        if (formattedChats.length > cacheBatchSize) {
+          const remainingChatIds = formattedChats.slice(cacheBatchSize).map(c => c.chatId);
+          setTimeout(async () => {
+            try {
+              const remainingChats = await Chat.find({
+                userId,
+                chatId: { $in: remainingChatIds }
+              }).maxTimeMS(10000);
+
+              remainingChats.forEach(chat => {
+                setCachedChat(userId, chat.chatId, chat);
+              });
+            } catch (error) {
+              console.error("Delayed background caching error:", error);
+            }
+          }, 2000);
+        }
       } catch (error) {
         console.error("Background caching error:", error);
       }
     }, 0);
-    const totalDocs = await Chat.countDocuments({ userId })
+
+    const totalDocs = await Chat.countDocuments(filter)
       .maxTimeMS(3000);
 
     res.json({
@@ -522,7 +647,17 @@ exports.getServiceStatus = async (req, res) => {
       avgChatSize: await Chat.aggregate([
         { $project: { messageCount: { $size: "$messages" } } },
         { $group: { _id: null, avg: { $avg: "$messageCount" } } }
-      ]).then(result => result[0]?.avg || 0)
+      ]).then(result => result[0]?.avg || 0),
+      recentActivity: await Chat.countDocuments({
+        updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+      })
+    };
+
+    const systemLoad = {
+      cpuUsage: process.cpuUsage(),
+      memoryUsage: process.memoryUsage(),
+      uptime: process.uptime(),
+      loadAverage: process.platform === 'win32' ? [0, 0, 0] : require('os').loadavg()
     };
 
     res.json({
@@ -533,7 +668,8 @@ exports.getServiceStatus = async (req, res) => {
       },
       performance: metrics.performance,
       database: dbStats,
-      memory: process.memoryUsage()
+      system: systemLoad,
+      aiService: metrics.api
     });
   } catch (error) {
     return handleError(res, error, "Error fetching service status");

@@ -84,53 +84,157 @@ class AdvancedPerformanceCache {
     this.errors = 0;
     this.lastCleanup = Date.now();
     this.cleanupInterval = 60 * 60 * 1000;
+    this.accessOrder = [];
+
+    this.avgAccessTime = 0;
+    this.totalAccessTime = 0;
+    this.maxAccessTime = 0;
+    this.accessCount = 0;
+    this.hitsByKey = new Map();
+    this.accessTimes = new Map();
+    this.priorityKeys = new Set();
+    this._scheduleCleanup();
   }
 
-  set(key, value) {
-    this._performCleanupIfNeeded();
+  set(key, value, isPriority = false) {
+    const startTime = performance.now();
+    try {
+      this._performCleanupIfNeeded();
+      if (this.cache.size >= this.maxSize) {
+        this._evictLRU(isPriority);
+      }
+      this._updateAccessOrder(key);
+      this.cache.set(key, {
+        value,
+        timestamp: Date.now(),
+        accessCount: 0,
+        lastAccessed: Date.now(),
+        isPriority
+      });
 
-    if (this.cache.size >= this.maxSize) {
-      const oldestKey = this.cache.keys().next().value;
-      this.cache.delete(oldestKey);
-      this.evictions++;
+      if (isPriority) {
+        this.priorityKeys.add(key);
+      }
+
+      const accessTime = performance.now() - startTime;
+      this._updateAccessMetrics(accessTime);
+
+      return value;
+    } catch (error) {
+      this.errors++;
+      console.error(`Cache error in ${this.name}.set():`, error);
+      throw error;
     }
-
-    this.cache.set(key, {
-      value,
-      timestamp: Date.now(),
-      accessCount: 0
-    });
-    return value;
   }
 
   get(key) {
+    const startTime = performance.now();
     this.total++;
-    this._performCleanupIfNeeded();
-    if (!this.cache.has(key)) {
-      this.misses++;
-      return null;
-    }
+    try {
+      this._performCleanupIfNeeded();
+      if (!this.cache.has(key)) {
+        this.misses++;
+        return null;
+      }
 
-    const entry = this.cache.get(key);
-    if (Date.now() - entry.timestamp > this.ttlMs) {
-      this.cache.delete(key);
-      this.misses++;
+      const entry = this.cache.get(key);
+      if (Date.now() - entry.timestamp > this.ttlMs) {
+        this.cache.delete(key);
+        this._removeFromAccessOrder(key);
+        this.priorityKeys.delete(key);
+        this.misses++;
+        this.evictions++;
+        return null;
+      }
+      this._updateAccessOrder(key);
+      entry.accessCount++;
+      entry.lastAccessed = Date.now();
+      this.hitsByKey.set(key, (this.hitsByKey.get(key) || 0) + 1);
+
+      this.hits++;
+      const accessTime = performance.now() - startTime;
+      this._updateAccessMetrics(accessTime);
+      const accessTimeBucket = Math.floor(accessTime);
+      this.accessTimes.set(accessTimeBucket, (this.accessTimes.get(accessTimeBucket) || 0) + 1);
+
+      return entry.value;
+    } catch (error) {
+      this.errors++;
+      console.error(`Cache error in ${this.name}.get():`, error);
       return null;
     }
-    entry.accessCount++;
-    entry.lastAccessed = Date.now();
-    this.hits++;
-    return entry.value;
   }
 
   has(key) {
-    if (!this.cache.has(key)) return false;
-    const entry = this.cache.get(key);
-    if (Date.now() - entry.timestamp > this.ttlMs) {
-      this.cache.delete(key);
+    try {
+      if (!this.cache.has(key)) return false;
+
+      const entry = this.cache.get(key);
+      if (Date.now() - entry.timestamp > this.ttlMs) {
+        this.cache.delete(key);
+        this._removeFromAccessOrder(key);
+        this.priorityKeys.delete(key);
+        this.evictions++;
+        return false;
+      }
+      this._updateAccessOrder(key);
+      return true;
+    } catch (error) {
+      this.errors++;
+      console.error(`Cache error in ${this.name}.has():`, error);
       return false;
     }
-    return true;
+  }
+
+  _updateAccessOrder(key) {
+    this._removeFromAccessOrder(key);
+    this.accessOrder.push(key);
+    if (this.accessOrder.length > this.maxSize * 1.5) {
+      this.accessOrder = this.accessOrder.slice(-this.maxSize);
+    }
+  }
+
+  _removeFromAccessOrder(key) {
+    const index = this.accessOrder.indexOf(key);
+    if (index > -1) {
+      this.accessOrder.splice(index, 1);
+    }
+  }
+
+  _evictLRU(protectPriority = false) {
+    if (protectPriority && this.cache.size > this.priorityKeys.size) {
+      for (let i = 0; i < this.accessOrder.length; i++) {
+        const key = this.accessOrder[i];
+        if (this.cache.has(key) && !this.priorityKeys.has(key)) {
+          this.accessOrder.splice(i, 1);
+          this.cache.delete(key);
+          this.evictions++;
+          return;
+        }
+      }
+    }
+    while (this.accessOrder.length > 0) {
+      const lruKey = this.accessOrder.shift();
+      if (this.cache.has(lruKey)) {
+        this.cache.delete(lruKey);
+        this.priorityKeys.delete(lruKey);
+        this.evictions++;
+        return;
+      }
+    }
+    if (this.cache.size > 0) {
+      const oldestKey = this.cache.keys().next().value;
+      this.cache.delete(oldestKey);
+      this.priorityKeys.delete(oldestKey);
+      this.evictions++;
+    }
+  }
+
+  _updateAccessMetrics(accessTime) {
+    this.accessCount++;
+    this.totalAccessTime += accessTime;
+    this.avgAccessTime = this.totalAccessTime / this.accessCount;
+    this.maxAccessTime = Math.max(this.maxAccessTime, accessTime);
   }
 
   _performCleanupIfNeeded() {
@@ -141,17 +245,44 @@ class AdvancedPerformanceCache {
     }
   }
 
+  _scheduleCleanup() {
+    setInterval(() => {
+      try {
+        this._cleanup();
+      } catch (error) {
+        console.error(`Scheduled cleanup error in ${this.name}:`, error);
+        this.errors++;
+      }
+    }, this.cleanupInterval);
+  }
+
   _cleanup() {
     const now = Date.now();
+    let expiredCount = 0;
+    const keysToDelete = [];
+
     for (const [key, entry] of this.cache.entries()) {
       if (now - entry.timestamp > this.ttlMs) {
-        this.cache.delete(key);
-        this.evictions++;
+        keysToDelete.push(key);
       }
     }
+
+    keysToDelete.forEach(key => {
+      this.cache.delete(key);
+      this._removeFromAccessOrder(key);
+      expiredCount++;
+    });
   }
 
   getStats() {
+    const topHits = [...this.hitsByKey.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([key, hits]) => ({
+        key: key.substring(0, 20) + (key.length > 20 ? '...' : ''),
+        hits
+      }));
+
     return {
       name: this.name,
       size: this.cache.size,
@@ -161,17 +292,50 @@ class AdvancedPerformanceCache {
       misses: this.misses,
       total: this.total,
       evictions: this.evictions,
-      errors: this.errors
+      errors: this.errors,
+      avgAccessTimeMs: this.avgAccessTime.toFixed(2),
+      maxAccessTimeMs: this.maxAccessTime.toFixed(2),
+      memoryEstimateKB: this._estimateMemoryUsage(),
+      priorityKeysCount: this.priorityKeys.size,
+      topHits
     };
+  }
+
+  _estimateMemoryUsage() {
+    let totalSize = 0;
+    const baseSize = 1024;
+    for (const [key, entry] of this.cache.entries()) {
+      const keySize = key.length * 2;
+      let valueSize = 100;
+      if (typeof entry.value === 'string') {
+        valueSize = entry.value.length * 2;
+      } else if (typeof entry.value === 'object') {
+        try {
+          valueSize = JSON.stringify(entry.value).length * 2;
+        } catch (e) {
+          valueSize = 500;
+        }
+      }
+      const metadataSize = 48;
+      totalSize += keySize + valueSize + metadataSize;
+    }
+    const accessOrderSize = this.accessOrder.length * 8;
+
+    return Math.round((baseSize + totalSize + accessOrderSize) / 1024);
   }
 
   clear() {
     this.cache.clear();
+    this.accessOrder = [];
     this.hits = 0;
     this.misses = 0;
     this.total = 0;
     this.evictions = 0;
     this.errors = 0;
+    this.totalAccessTime = 0;
+    this.avgAccessTime = 0;
+    this.maxAccessTime = 0;
+    this.accessCount = 0;
   }
 }
 
@@ -191,51 +355,101 @@ const performanceMetrics = {
   startTime: Date.now(),
   timeouts: 0,
   retries: 0,
-  successfulRetries: 0
+  successfulRetries: 0,
+  currentThrottleLevel: 0,
+  lastThrottleAdjustment: Date.now(),
+  concurrentRequests: 0,
+  maxConcurrentRequests: 0,
+  adaptiveTimeoutMs: REQUEST_TIMEOUT
 };
+
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.count = 0;
+    this.waiters = [];
+  }
+
+  async acquire() {
+    if (this.count < this.max) {
+      this.count++;
+      performanceMetrics.concurrentRequests = this.count;
+      performanceMetrics.maxConcurrentRequests = Math.max(performanceMetrics.maxConcurrentRequests, this.count);
+      return;
+    }
+
+    return new Promise(resolve => {
+      this.waiters.push(resolve);
+    });
+  }
+
+  release() {
+    if (this.waiters.length > 0) {
+      const resolve = this.waiters.shift();
+      resolve();
+    } else {
+      this.count--;
+      performanceMetrics.concurrentRequests = this.count;
+    }
+  }
+
+  get available() {
+    return this.max - this.count;
+  }
+}
+
+const requestSemaphore = new Semaphore(10);
 
 async function withRetry(fn, maxRetries = MAX_RETRIES, initialDelay = RETRY_DELAY, shouldThrow = false) {
   let lastError;
   let attempt = 1;
+  await requestSemaphore.acquire();
 
-  while (attempt <= maxRetries) {
-    try {
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => {
-          reject(new Error(`Request timed out after ${REQUEST_TIMEOUT}ms`));
-        }, REQUEST_TIMEOUT);
-      });
-      const result = await Promise.race([fn(), timeoutPromise]);
-      if (attempt > 1) {
-        performanceMetrics.successfulRetries++;
-      }
+  try {
+    const timeout = performanceMetrics.adaptiveTimeoutMs * (1 + (performanceMetrics.currentThrottleLevel / 10));
 
-      return result;
-    } catch (error) {
-      console.error(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
-      lastError = error;
-      performanceMetrics.retries++;
-      const isConnectionError = error.code === 'ECONNRESET' ||
-        error.code === 'ENOTFOUND' ||
-        error.code === 'ECONNREFUSED' ||
-        error.message.includes('fetch failed');
+    while (attempt <= maxRetries) {
+      try {
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`Request timed out after ${timeout}ms`));
+          }, timeout);
+        });
+        const result = await Promise.race([fn(), timeoutPromise]);
+        if (attempt > 1) {
+          performanceMetrics.successfulRetries++;
+        }
 
-      if (isConnectionError) {
-        console.warn(`Network connection error (${error.code || 'fetch failed'}). Will retry with exponential backoff.`);
-        const networkBackoff = initialDelay * Math.pow(3, attempt - 1);
-        await new Promise(resolve => setTimeout(resolve, networkBackoff));
-      } else if (error.message.includes('timed out')) {
-        performanceMetrics.timeouts++;
-      }
+        return result;
+      } catch (error) {
+        console.error(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
+        lastError = error;
+        performanceMetrics.retries++;
+        const isConnectionError = error.code === 'ECONNRESET' ||
+          error.code === 'ENOTFOUND' ||
+          error.code === 'ECONNREFUSED' ||
+          error.message.includes('fetch failed');
 
-      if (attempt < maxRetries) {
-        const delay = initialDelay * Math.pow(2, attempt - 1);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        attempt++;
-      } else {
-        break;
+        if (isConnectionError) {
+          console.warn(`Network connection error (${error.code || 'fetch failed'}). Will retry with exponential backoff.`);
+          const networkBackoff = initialDelay * Math.pow(3, attempt - 1);
+          await new Promise(resolve => setTimeout(resolve, networkBackoff));
+        } else if (error.message.includes('timed out')) {
+          performanceMetrics.timeouts++;
+        }
+
+        if (attempt < maxRetries) {
+          const jitter = Math.random() * 0.3 + 0.85;
+          const delay = initialDelay * Math.pow(2, attempt - 1) * jitter;
+          await new Promise(resolve => setTimeout(resolve, delay));
+          attempt++;
+        } else {
+          break;
+        }
       }
     }
+  } finally {
+    requestSemaphore.release();
   }
 
   if (shouldThrow) {
@@ -295,11 +509,43 @@ async function checkConnectionHealth() {
 
 async function batchProcessQueries(queries) {
   if (!queries || !queries.length) return [];
+  const prioritizedQueries = await Promise.all(
+    queries.map(async query => ({
+      query,
+      priority: await prioritizeQuery(query)
+    }))
+  );
+  prioritizedQueries.sort((a, b) => {
+    const priorityOrder = { high: 0, medium: 1, normal: 2 };
+    return priorityOrder[a.priority] - priorityOrder[b.priority];
+  });
 
   const results = [];
-  for (let i = 0; i < queries.length; i += BATCH_SIZE) {
-    const batch = queries.slice(i, i + BATCH_SIZE);
-    const batchPromises = batch.map(query => processQuery(query));
+  let currentBatch = [];
+  let currentBatchSize = 0;
+
+  for (const { query, priority } of prioritizedQueries) {
+    if (priority === 'high' && currentBatchSize > 0) {
+      const batchPromises = currentBatch.map(q => processQuery(q));
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+      currentBatch = [];
+      currentBatchSize = 0;
+    }
+
+    currentBatch.push(query);
+    currentBatchSize++;
+    const batchLimit = priority === 'high' ? 2 : BATCH_SIZE;
+    if (currentBatchSize >= batchLimit) {
+      const batchPromises = currentBatch.map(q => processQuery(q));
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+      currentBatch = [];
+      currentBatchSize = 0;
+    }
+  }
+  if (currentBatchSize > 0) {
+    const batchPromises = currentBatch.map(q => processQuery(q));
     const batchResults = await Promise.all(batchPromises);
     results.push(...batchResults);
   }
@@ -665,31 +911,55 @@ function getUnavailableServiceResponse() {
 
 async function processQuery(query) {
   try {
+    adjustThrottling();
+
     if (connectionHealth.consecutiveErrors > 0) {
       await checkConnectionHealth();
     }
+    const cacheKey = query.toLowerCase().trim();
+    const cachedResponse = responseCache.get(cacheKey);
+    const cachedClassification = dynamicClassificationCache.get(cacheKey);
 
+    if (cachedResponse && cachedClassification) {
+      return {
+        response: cachedResponse,
+        classification: cachedClassification,
+        fromCache: true,
+        cacheHit: true
+      };
+    }
+
+    const queryAnalysis = analyzeQueryCharacteristics(query);
     const basicClassification = classifyQuery(query);
+    basicClassification.queryAnalysis = queryAnalysis;
     if (!connectionHealth.isStable || !geminiApiStatus.isAvailable) {
       if (basicClassification.category === "general_chat" || !basicClassification.isLegal) {
+        const response = handleNonLegalQuery(query, basicClassification);
         return {
-          response: handleNonLegalQuery(query, basicClassification),
+          response,
           classification: basicClassification,
           fromCache: true
         };
       }
       return getUnavailableServiceResponse();
     }
+
     try {
+      const startTime = Date.now();
       const classification = await classifyQueryDynamic(query);
       const response = await generateGeminiResponse(query, classification);
+      const processingTime = Date.now() - startTime;
+      const isPriority = processingTime < 1000 || classification.isLegal;
+      responseCache.set(cacheKey, response, isPriority);
+
       if (connectionHealth.consecutiveErrors > 0) {
         connectionHealth.consecutiveErrors = 0;
         connectionHealth.isStable = true;
       }
       return {
         response,
-        classification
+        classification,
+        processingTime
       };
     } catch (error) {
       console.error("Error in AI processing:", error);
@@ -961,39 +1231,162 @@ function handleNonLegalQuery(query, classification) {
   return handler ? handler(query, classification) : redirectToLegalHelp(query, classification);
 }
 
+function analyzeQueryCharacteristics(query) {
+  const length = query.length;
+  const wordCount = query.split(/\s+/).filter(word => word.length > 0).length;
+  const hasQuestion = /\?/.test(query);
+  const isVeryShort = wordCount <= 3;
+  const isShort = wordCount <= 5;
+  const isMedium = wordCount > 5 && wordCount <= 15;
+  const isLong = wordCount > 15;
+  const hasNumbers = /\d+/.test(query);
+  const hasSpecialSymbols = /[@#$%^&*()_+\-=\[\]{};':"\\|,<>\/?]/.test(query);
+  const hasMultipleQuestions = (query.match(/\?/g) || []).length > 1;
+  const endsWithQuestion = query.trim().endsWith('?');
+  const startsWithGreeting = GREETING_REGEX.test(query.toLowerCase());
+  const containsPlease = /please/i.test(query);
+  const hasMultipleSentences = query.split(/[.!?]+/).filter(s => s.trim().length > 0).length > 1;
+  const hasAllCaps = /[A-Z]{3,}/.test(query);
+  const formality = containsPlease ? 'formal' : (hasAllCaps ? 'urgent' : 'neutral');
+
+  return {
+    length,
+    wordCount,
+    hasQuestion,
+    isVeryShort,
+    isShort,
+    isMedium,
+    isLong,
+    hasNumbers,
+    hasSpecialSymbols,
+    hasMultipleQuestions,
+    endsWithQuestion,
+    startsWithGreeting,
+    containsPlease,
+    hasMultipleSentences,
+    hasAllCaps,
+    formality
+  };
+}
+
+const responseTemplates = {
+  greeting: {
+    formal: "Namaste! I'm Juris, your legal assistant for Indian law. How may I be of service regarding your legal inquiry today?",
+    casual: "Hi there! I'm Juris, here to help with Indian law questions. What's on your mind?",
+    neutral: "Namaste! I'm Juris, your legal assistant for Indian law. How can I help you with your legal query today?",
+    short: "Hello! I'm Juris. How can I help you?",
+    verbose: "Greetings and a warm welcome! I'm Juris, an AI assistant specialized in Indian law and legal processes. I'm here to provide guidance, information, and support with any legal queries you might have. How may I assist you with your legal matters today?"
+  },
+  about: {
+    short: "I'm Juris, an AI legal assistant for Indian law.",
+    neutral: "I'm Juris, an AI assistant specialized in Indian law. I can help answer legal questions, explain procedures, and guide you to appropriate resources.",
+    detailed: "I'm Juris, an AI assistant specialized in Indian law. I can help answer legal questions, explain legal procedures, provide information about your rights, and guide you to appropriate resources. While I'm designed to assist with legal topics in India, I'm not a lawyer and my responses shouldn't replace professional legal advice.",
+    technical: "I'm Juris, a legal AI trained on Indian legal frameworks, statutes, and precedents to provide information and guidance on legal matters. I'm designed to interpret queries, analyze legal contexts, and provide relevant information while maintaining accuracy. I can reference specific laws, explain procedures, and simplify complex legal concepts."
+  },
+  capabilities: {
+    short: "I can help with Indian laws, legal terms, procedures, and resources.",
+    neutral: "As Juris, I can:\n\n- Answer questions about Indian laws and legal procedures\n- Explain legal terms in simple language\n- Guide you to relevant legal resources\n- Help understand documents like notices or summons\n- Provide information on various legal processes\n- Direct you to emergency legal services when needed",
+    detailed: "As Juris, I can:\n\n- Answer questions about Indian laws and legal procedures\n- Explain legal terms in simple language\n- Guide you to relevant legal resources\n- Help understand documents like notices or summons\n- Provide information on various legal processes\n- Direct you to emergency legal services when needed\n- Explain your rights in specific situations\n- Clarify legal obligations and requirements\n- Help with understanding legal documents\n- Provide information about court procedures\n- Explain remedies available in different situations\n- Guide on filing complaints with appropriate authorities\n\nWhat legal matter can I assist you with today?"
+  },
+  thanks: {
+    short: "You're welcome!",
+    neutral: "You're welcome! I'm glad I could be of assistance. Feel free to ask if you have other legal questions.",
+    warm: "You're very welcome! I'm delighted I could help. Legal matters can be complex, so please don't hesitate to reach out again if you need further clarification or have other questions about Indian law.",
+    professional: "You're welcome! It's been my pleasure to assist you with your legal inquiry. If other questions arise or you need further clarification on any legal matter, please don't hesitate to ask. I'm here to help navigate the complexities of Indian law."
+  },
+  redirect: {
+    concise: "I specialize in Indian law. How can I help with your legal concerns?",
+    polite: "I'm specialized in providing information about Indian law and legal procedures. How can I assist you with a legal concern today?",
+    detailed: "I'm specialized in providing information about Indian law and legal procedures. While I don't have enough context to address your current question, I'd be happy to help with any legal matters you might have. You could ask about rights, procedures, documents, or specific laws in India. How can I assist you with a legal concern today?",
+    examples: "I'm specialized in Indian law. You could ask me questions like:\n- What are my rights if I'm arrested?\n- How do I file for divorce?\n- What does this legal notice mean?\n- How can I register a property?\n\nWhat legal matter can I help you with?"
+  }
+};
+
+function selectResponseVariation(templates, queryAnalysis) {
+  if (queryAnalysis.isVeryShort) {
+    return templates.short || templates.concise || templates.neutral;
+  } else if (queryAnalysis.isLong) {
+    return templates.detailed || templates.verbose || templates.neutral;
+  } else if (queryAnalysis.formality === 'formal') {
+    return templates.professional || templates.formal || templates.neutral;
+  } else if (queryAnalysis.hasAllCaps) {
+    return templates.concise || templates.short || templates.neutral;
+  } else {
+    return templates.neutral;
+  }
+}
+
 function generateChatResponse(query, _classification) {
   const q = query.toLowerCase().trim();
-
+  const queryAnalysis = analyzeQueryCharacteristics(query);
   if (q === "hi" || q === "hello" || q === "hey" || q === "namaste" || GREETING_REGEX.test(q)) {
-    return "Namaste! I'm Juris, your legal assistant for Indian law. How can I help you with your legal query today?";
+    return selectResponseVariation(responseTemplates.greeting, queryAnalysis);
   }
   if (ABOUT_REGEX.test(q)) {
-    return "I'm Juris, an AI assistant specialized in Indian law. I can help answer legal questions, explain legal procedures, provide information about your rights, and guide you to appropriate resources. While I'm designed to assist with legal topics in India, I'm not a lawyer and my responses shouldn't replace professional legal advice.";
+    return selectResponseVariation(responseTemplates.about, queryAnalysis);
   }
   if (CAPABILITIES_REGEX.test(q)) {
-    return "As Juris, I can:\n\n- Answer questions about Indian laws and legal procedures\n- Explain legal terms in simple language\n- Guide you to relevant legal resources\n- Help understand documents like notices or summons\n- Provide information on various legal processes\n- Direct you to emergency legal services when needed\n\nWhat legal matter can I assist you with today?";
+    return selectResponseVariation(responseTemplates.capabilities, queryAnalysis);
   }
   if (THANKS_REGEX.test(q)) {
-    return "You're welcome! I'm glad I could be of assistance. If you have any other legal questions in the future, feel free to ask. Is there anything else you'd like to know about Indian law?";
+    return selectResponseVariation(responseTemplates.thanks, queryAnalysis);
+  }
+  if (queryAnalysis.hasQuestion) {
+    if (queryAnalysis.isShort) {
+      return "I'd be happy to help with your question about Indian law. Could you provide a bit more context so I can give you the most accurate information?";
+    } else {
+      return "Thank you for your question. I'm here to help with legal questions related to Indian law. Could you clarify which specific legal aspect you're inquiring about?";
+    }
+  }
+
+  if (queryAnalysis.isVeryShort) {
+    return "I'm here to help with Indian legal questions. What specific legal matter are you interested in?";
   }
 
   return "I'm here to help with legal questions related to Indian law. Could you please share what legal matter you're inquiring about? For example, you might ask about family law, property rights, or criminal procedures.";
 }
 
 function generateTechnicalSupportResponse(query) {
-  return "I notice you might be having technical issues. While I'm designed to help with legal questions, I'd be happy to assist with basic troubleshooting. For specific technical problems with the Juris application, you may want to contact our support team. In the meantime, is there a legal question I can help you with?";
+  const queryAnalysis = analyzeQueryCharacteristics(query);
+
+  if (queryAnalysis.hasAllCaps || queryAnalysis.formality === 'urgent') {
+    return "I see you're experiencing technical difficulties. While I focus on legal assistance, I'll notify our support team about this issue immediately. In the meantime, is there a legal question I can help with?";
+  } else if (queryAnalysis.isLong) {
+    return "Thank you for providing these technical details. While I'm designed primarily for legal questions, I've noted the issues you're experiencing. Our support team would be best equipped to help with these specific technical problems. You can reach them at support@juris.ai. Meanwhile, I'm still available to assist with any legal questions you might have.";
+  } else {
+    return "I notice you might be having technical issues. While I'm designed to help with legal questions, I'd be happy to assist with basic troubleshooting. For specific technical problems with the Juris application, you may want to contact our support team. In the meantime, is there a legal question I can help you with?";
+  }
 }
 
 function generateFeedbackResponse(query) {
-  return "Thank you for your feedback! We're constantly working to improve Juris to better serve your legal information needs. Your input helps us grow. If you have specific legal questions or concerns, I'd be happy to address those for you now.";
+  const queryAnalysis = analyzeQueryCharacteristics(query);
+
+  if (queryAnalysis.hasQuestion) {
+    return "Thank you for your feedback and question! We truly value your input as it helps us improve. Regarding your inquiry, I'd be happy to provide more information - could you please elaborate so I can address your specific concern?";
+  } else if (/thank|great|good|excellent|amazing/i.test(query)) {
+    return "I'm delighted to hear your positive feedback! It's wonderful to know that Juris has been helpful for your legal information needs. We strive to make legal knowledge accessible to everyone. Is there anything specific about the service that you particularly appreciate or any features you'd like to see in the future?";
+  } else if (/poor|bad|terrible|awful|useless|not working|doesn't work/i.test(query)) {
+    return "I sincerely apologize for any disappointment with our service. Your feedback is invaluable for our improvement. Could you share more specific details about what didn't meet your expectations? We're committed to addressing these issues promptly to better serve your legal information needs.";
+  } else {
+    return "Thank you for your feedback! We're constantly working to improve Juris to better serve your legal information needs. Your input helps us grow. If you have specific legal questions or concerns, I'd be happy to address those for you now.";
+  }
 }
 
 function generateRelatedServiceResponse(query) {
-  return "I notice you're asking about government services or procedures. While I specialize in legal information, many government processes have legal components I can help clarify. Could you provide more details about your specific situation so I can guide you appropriately? For comprehensive government service information, you might also find the National Government Services Portal (https://services.india.gov.in) helpful.";
+  const queryAnalysis = analyzeQueryCharacteristics(query);
+
+  if (queryAnalysis.hasNumbers) {
+    return "I notice you've mentioned some specific details about government services or procedures. While I specialize in legal information, I can help clarify how these processes relate to legal requirements or rights. For the most up-to-date government service information including forms, fees, and timelines, you may want to consult the National Government Services Portal (https://services.india.gov.in). Is there a specific legal aspect of this service you'd like me to explain?";
+  } else if (queryAnalysis.isLong) {
+    return "Thank you for providing these details about the government service you're inquiring about. Many administrative procedures have important legal implications. I can help explain the legal framework surrounding these services, your rights within these processes, and any legal recourse available if issues arise. For specific procedural details, the National Government Services Portal (https://services.india.gov.in) would have the most current information. Would you like me to focus on any particular legal aspect of this matter?";
+  } else {
+    return "I notice you're asking about government services or procedures. While I specialize in legal information, many government processes have legal components I can help clarify. Could you provide more details about your specific situation so I can guide you appropriately? For comprehensive government service information, you might also find the National Government Services Portal (https://services.india.gov.in) helpful.";
+  }
 }
 
 function redirectToLegalHelp(query, classification) {
-  return "I'm specialized in providing information about Indian law and legal procedures. While I don't have enough context to address your current question, I'd be happy to help with any legal matters you might have. You could ask about rights, procedures, documents, or specific laws in India. How can I assist you with a legal concern today?";
+  const queryAnalysis = analyzeQueryCharacteristics(query);
+  return selectResponseVariation(responseTemplates.redirect, queryAnalysis);
 }
 
 async function classifyQueryDynamic(query) {
@@ -1073,6 +1466,51 @@ function getEmergencyLegalResources() {
   return emergencyResourcesCache;
 }
 
+function adjustThrottling() {
+  const now = Date.now();
+  if (now - performanceMetrics.lastThrottleAdjustment < 30000) {
+    return;
+  }
+
+  const recentRequests = performanceMetrics.lastMinuteRequests.length;
+  const currentErrorRate = performanceMetrics.aiErrors / (performanceMetrics.aiCalls || 1);
+  const avgResponseTime = performanceMetrics.avgResponseTime;
+  let loadFactor = 0;
+  loadFactor += Math.min(recentRequests / 20, 3);
+  loadFactor += Math.min(currentErrorRate * 10, 4);
+  loadFactor += Math.min(avgResponseTime / 2000, 3);
+  performanceMetrics.currentThrottleLevel = Math.round(loadFactor);
+  performanceMetrics.adaptiveTimeoutMs = REQUEST_TIMEOUT * (1 + (performanceMetrics.currentThrottleLevel / 10));
+
+  performanceMetrics.lastThrottleAdjustment = now;
+  if (Math.abs(loadFactor - performanceMetrics.currentThrottleLevel) >= 2) {
+    console.log(`Throttling adjusted to level ${performanceMetrics.currentThrottleLevel} (load factor: ${loadFactor.toFixed(1)})`);
+  }
+}
+
+setInterval(adjustThrottling, 60000);
+
+async function prioritizeQuery(query) {
+  if (isEmergencyLegalQuery(query)) {
+    return 'high';
+  }
+  const q = query.toLowerCase();
+  if (
+    /deadline|urgent|tomorrow|today|tonight|immediately|asap|right now|hurry|quickly/.test(q) ||
+    /within \d+ (hour|day|week)|by (today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/.test(q)
+  ) {
+    return 'high';
+  }
+  if (
+    /how (do|can|should) i|what (is|are) the (step|procedure|process)|explain how to/.test(q) ||
+    query.length < 50
+  ) {
+    return 'medium';
+  }
+
+  return 'normal';
+}
+
 module.exports = {
   isLegalQuery,
   generateGeminiResponse,
@@ -1093,5 +1531,7 @@ module.exports = {
   batchProcessQueries,
   checkGeminiApiStatus,
   getUnavailableServiceResponse,
-  checkConnectionHealth
+  checkConnectionHealth,
+  prioritizeQuery,
+  adjustThrottling
 };
