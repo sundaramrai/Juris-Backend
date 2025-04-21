@@ -10,23 +10,33 @@ const { validateEnvVars } = require("./utils/validation");
 
 const PORT = process.env.PORT || 3000;
 const TIMEOUT = 120000;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-
-validateEnvVars();
-
 const app = express();
-
+validateEnvVars();
 app.use(helmet());
 app.use(compression());
-app.use(cors({
-  origin: CORS_ORIGIN,
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || origin.startsWith('http://localhost:')) {
+      return callback(null, true);
+    }
+    const allowedOrigins = process.env.CORS_ORIGINS.split(',');
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.log(`CORS blocked origin: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true,
-}));
+  credentials: true
+};
+
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
-(async function() {
+(async function () {
   try {
     await connectDatabase();
   } catch (err) {
