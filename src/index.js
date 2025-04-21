@@ -103,7 +103,7 @@ function startServer() {
   process.on("SIGTERM", () => gracefulShutdown(true));
   process.on("uncaughtException", (error) => {
     console.error("Uncaught exception:", error);
-    gracefulShutdown();
+    gracefulShutdown(false);
   });
 
   process.on("unhandledRejection", (reason, promise) => {
