@@ -14,34 +14,44 @@ const {
 const lockManager = require('../utils/lockManager');
 
 class LRUCache {
-  constructor(maxSize = 100, ttlMs = 15 * 60 * 1000) {
+  constructor(maxSize = 100, ttlMs = 15 * 60 * 1000, maxMemoryMB = 100) {
     this.cache = new Map();
     this.maxSize = maxSize;
     this.ttlMs = ttlMs;
-    this.stats = { hits: 0, misses: 0, evictions: 0 };
+    this.maxMemoryMB = maxMemoryMB;
+    this.estimatedMemoryUsage = 0;
+    this.stats = {
+      hits: 0,
+      misses: 0,
+      evictions: 0
+    };
     this.accessFrequency = new Map();
     this.lastCleanup = Date.now();
-    this.cleanupInterval = 5 * 60 * 1000;
+    this.lastCleanupTime = Date.now();
+    this.cleanupInterval = 60 * 1000;
+    this.hitCount = 0;
+    this.missCount = 0;
   }
 
   get(key) {
     const now = Date.now();
     this._checkCleanup(now);
-    if (!this.cache.has(key)) {
-      this.stats.misses++;
-      return null;
+
+    if (!this.has(key)) {
+      this.missCount++;
+      return undefined;
     }
 
     const item = this.cache.get(key);
-    if (now > item.expiry) {
-      this.cache.delete(key);
-      this.accessFrequency.delete(key);
-      this.stats.evictions++;
-      return null;
+    if (item.expiry < now) {
+      this.delete(key);
+      this.missCount++;
+      return undefined;
     }
-    this.accessFrequency.set(key, (this.accessFrequency.get(key) || 0) + 1);
-    item.expiry = now + this.ttlMs;
-    this.stats.hits++;
+
+    this.cache.delete(key);
+    this.cache.set(key, item);
+    this.hitCount++;
     return item.value;
   }
 
@@ -49,16 +59,20 @@ class LRUCache {
     const now = Date.now();
     this._checkCleanup(now);
 
-    if (this.cache.size >= this.maxSize) {
+    const itemSize = this._estimateObjectSize(value);
+    while (this.estimatedMemoryUsage + itemSize > this.maxMemoryMB * 1024 * 1024 && this.cache.size > 0) {
       this._evictLeastUsed();
     }
 
-    this.cache.set(key, {
-      value,
-      expiry: now + this.ttlMs
-    });
-    this.accessFrequency.set(key, 1);
-    return value;
+    const expiry = now + this.ttlMs;
+    this.cache.set(key, { value, expiry, size: itemSize });
+    this.estimatedMemoryUsage += itemSize;
+
+    if (this.cache.size > this.maxSize) {
+      this._evictLeastUsed();
+    }
+
+    return true;
   }
 
   delete(key) {
@@ -101,7 +115,13 @@ class LRUCache {
       hitRate: this.stats.hits + this.stats.misses > 0
         ? (this.stats.hits / (this.stats.hits + this.stats.misses)) * 100
         : 0,
-      memoryEstimate: this._estimateMemoryUsage()
+      memoryEstimate: this._estimateMemoryUsage(),
+      maxSize: this.maxSize,
+      memoryUsage: `${(this.estimatedMemoryUsage / (1024 * 1024)).toFixed(2)} MB`,
+      maxMemory: `${this.maxMemoryMB} MB`,
+      hitRate: this.hitCount + this.missCount === 0 ? 0 : this.hitCount / (this.hitCount + this.missCount),
+      hitCount: this.hitCount,
+      missCount: this.missCount
     };
   }
 
@@ -133,6 +153,10 @@ class LRUCache {
       this._cleanup(now);
       this.lastCleanup = now;
     }
+    if (now - this.lastCleanupTime > this.cleanupInterval) {
+      this._cleanup(now);
+      this.lastCleanupTime = now;
+    }
   }
 
   _cleanup(now) {
@@ -149,11 +173,36 @@ class LRUCache {
       this.accessFrequency.delete(key);
       this.stats.evictions++;
     });
+
+    let freedMemory = 0;
+    let removedCount = 0;
+
+    for (const [key, item] of this.cache.entries()) {
+      if (item.expiry < now) {
+        freedMemory += item.size;
+        removedCount++;
+        this.cache.delete(key);
+      }
+    }
+
+    this.estimatedMemoryUsage -= freedMemory;
+    if (removedCount > 0) {
+      console.log(`Cache cleanup: removed ${removedCount} expired items, freed ${(freedMemory / (1024 * 1024)).toFixed(2)} MB`);
+    }
+    if (this.estimatedMemoryUsage < 0) this.estimatedMemoryUsage = 0;
   }
 
   _estimateMemoryUsage() {
-    const entrySize = 200;
-    return Math.round((this.cache.size * entrySize) / 1024);
+    let total = 0;
+    for (const item of this.cache.values()) {
+      total += item.size || 0;
+    }
+    return total;
+  }
+
+  _estimateObjectSize(obj) {
+    const stringify = JSON.stringify(obj);
+    return stringify ? stringify.length * 2 : 0;
   }
 }
 
