@@ -336,6 +336,7 @@ class AdvancedPerformanceCache {
     this.avgAccessTime = 0;
     this.maxAccessTime = 0;
     this.accessCount = 0;
+    this.priorityKeys = new Set();
   }
 }
 

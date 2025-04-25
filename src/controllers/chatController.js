@@ -1,4 +1,5 @@
 // src/controllers/chatController.js
+const mongoose = require('mongoose');
 const Chat = require("../models/Chat");
 const { v4: uuidv4 } = require("uuid");
 const { encryptText, decryptText } = require("../utils/encryption");
@@ -12,6 +13,7 @@ const {
   prioritizeQuery
 } = require("../services/aiService");
 const lockManager = require('../utils/lockManager');
+const dbConnection = require('../config/dbConnection');
 
 class LRUCache {
   constructor(maxSize = 100, ttlMs = 15 * 60 * 1000, maxMemoryMB = 100) {
@@ -264,6 +266,47 @@ const batchDecryptMessages = (messages) => {
   return results;
 };
 
+const executeDbOperation = async (operation, maxRetries = 3) => {
+  let retries = 0;
+  while (retries < maxRetries) {
+    try {
+      if (mongoose.connection.readyState !== 1) {
+        console.warn(`MongoDB not connected (state: ${mongoose.connection.readyState}). Attempting to reconnect...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        if (mongoose.connection.readyState !== 1) {
+          try {
+            await dbConnection.connect();
+          } catch (connError) {
+            console.error("Reconnection attempt failed:", connError.message);
+          }
+        }
+      }
+
+      return await operation();
+    } catch (error) {
+      retries++;
+      const isConnectionError =
+        error.name === 'MongoNetworkError' ||
+        error.name === 'MongoTimeoutError' ||
+        error.message.includes('topology') ||
+        error.message.includes('connection') ||
+        error.name === 'MongoServerSelectionError';
+
+      if (isConnectionError && retries < maxRetries) {
+        console.warn(`MongoDB operation failed due to connection issue. Retrying (${retries}/${maxRetries})...`);
+        await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+        try {
+          await dbConnection.connect();
+        } catch (connError) {
+          console.error("Reconnection attempt failed:", connError.message);
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+};
+
 exports.processChat = async (req, res) => {
   try {
     const { message, chatId } = req.body;
@@ -299,8 +342,9 @@ exports.processChat = async (req, res) => {
     if (chatId) {
       chat = getCachedChat(userId, chatId);
       if (!chat) {
-        chat = await Chat.findOne({ userId, chatId })
-          .maxTimeMS(5000);
+        chat = await executeDbOperation(async () => {
+          return await Chat.findOne({ userId, chatId }).maxTimeMS(5000);
+        });
       }
     }
 
@@ -341,13 +385,22 @@ exports.processChat = async (req, res) => {
       chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
     }
     const chatSavePromise = lockManager.withLock(chat._id.toString(), async () => {
-      const freshChat = await Chat.findById(chat._id);
-      if (freshChat) {
-        freshChat.messages = chat.messages;
-        freshChat.lastActivity = chat.lastActivity;
-        freshChat.chatSummary = chat.chatSummary;
-        freshChat.title = chat.title;
-        await freshChat.save();
+      try {
+        await executeDbOperation(async () => {
+          const freshChat = await Chat.findById(chat._id);
+          if (freshChat) {
+            freshChat.messages = chat.messages;
+            freshChat.lastActivity = chat.lastActivity;
+            freshChat.chatSummary = chat.chatSummary;
+            freshChat.title = chat.title;
+            await freshChat.save();
+          }
+        });
+      } catch (error) {
+        console.error("Error saving chat with lock:", error);
+        await executeDbOperation(async () => {
+          await chat.save();
+        });
       }
     });
 
@@ -414,13 +467,15 @@ exports.getAllChats = async (req, res) => {
       filter.title = { $regex: req.query.keyword, $options: 'i' };
     }
 
-    const chats = await Chat.find(filter)
-      .sort({ updatedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .select('chatId title chatSummary createdAt updatedAt messages.time')
-      .lean()
-      .maxTimeMS(5000);
+    const chats = await executeDbOperation(async () => {
+      return await Chat.find(filter)
+        .sort({ updatedAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .select('chatId title chatSummary createdAt updatedAt messages.time')
+        .lean()
+        .maxTimeMS(5000);
+    });
 
     const formattedChats = await Promise.all(chats
       .filter(chat => chat.messages && chat.messages.length > 0)
@@ -451,10 +506,12 @@ exports.getAllChats = async (req, res) => {
     setTimeout(async () => {
       try {
         const chatIds = formattedChats.slice(0, cacheBatchSize).map(c => c.chatId);
-        const fullChats = await Chat.find({
-          userId,
-          chatId: { $in: chatIds }
-        }).maxTimeMS(10000);
+        const fullChats = await executeDbOperation(async () => {
+          return await Chat.find({
+            userId,
+            chatId: { $in: chatIds }
+          }).maxTimeMS(10000);
+        });
 
         fullChats.forEach(chat => {
           setCachedChat(userId, chat.chatId, chat);
@@ -463,10 +520,12 @@ exports.getAllChats = async (req, res) => {
           const remainingChatIds = formattedChats.slice(cacheBatchSize).map(c => c.chatId);
           setTimeout(async () => {
             try {
-              const remainingChats = await Chat.find({
-                userId,
-                chatId: { $in: remainingChatIds }
-              }).maxTimeMS(10000);
+              const remainingChats = await executeDbOperation(async () => {
+                return await Chat.find({
+                  userId,
+                  chatId: { $in: remainingChatIds }
+                }).maxTimeMS(10000);
+              });
 
               remainingChats.forEach(chat => {
                 setCachedChat(userId, chat.chatId, chat);
@@ -481,8 +540,9 @@ exports.getAllChats = async (req, res) => {
       }
     }, 0);
 
-    const totalDocs = await Chat.countDocuments(filter)
-      .maxTimeMS(3000);
+    const totalDocs = await executeDbOperation(async () => {
+      return await Chat.countDocuments(filter).maxTimeMS(3000);
+    });
 
     res.json({
       chats: formattedChats,
@@ -510,7 +570,9 @@ exports.getChatHistory = async (req, res) => {
     }
     let chat = getCachedChat(userId, chatId);
     if (!chat) {
-      chat = await Chat.findOne({ userId, chatId });
+      chat = await executeDbOperation(async () => {
+        return await Chat.findOne({ userId, chatId });
+      });
       if (chat) {
         setCachedChat(userId, chatId, chat);
       }
@@ -563,11 +625,13 @@ exports.clearChatHistory = async (req, res) => {
     if (!chatId) {
       return res.status(400).json({ message: "Chat ID is required" });
     }
-    const chat = await Chat.findOneAndUpdate(
-      { userId, chatId },
-      { $set: { messages: [], chatSummary: "" } },
-      { new: true }
-    );
+    const chat = await executeDbOperation(async () => {
+      return await Chat.findOneAndUpdate(
+        { userId, chatId },
+        { $set: { messages: [], chatSummary: "" } },
+        { new: true }
+      );
+    });
 
     if (!chat) {
       return res.status(404).json({ message: "Chat not found" });
@@ -586,7 +650,9 @@ exports.cleanupEmptyChats = async (req, res) => {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
-    const result = await Chat.deleteMany({ "messages": { $size: 0 } });
+    const result = await executeDbOperation(async () => {
+      return await Chat.deleteMany({ "messages": { $size: 0 } });
+    });
 
     res.json({
       message: "Cleanup completed",
@@ -611,7 +677,9 @@ exports.createNewChat = async (req, res) => {
     });
 
     await lockManager.withLock(newChat._id.toString(), async () => {
-      await newChat.save();
+      await executeDbOperation(async () => {
+        await newChat.save();
+      });
     });
 
     res.json({
@@ -641,11 +709,13 @@ exports.updateChatTitle = async (req, res) => {
     }
 
     const sanitizedTitle = title.trim().substring(0, 100);
-    const chat = await Chat.findOneAndUpdate(
-      { userId, chatId },
-      { title: sanitizedTitle },
-      { new: true }
-    );
+    const chat = await executeDbOperation(async () => {
+      return await Chat.findOneAndUpdate(
+        { userId, chatId },
+        { title: sanitizedTitle },
+        { new: true }
+      );
+    });
 
     if (!chat) {
       return res.status(404).json({ message: "Chat not found" });
@@ -670,7 +740,9 @@ exports.deleteChat = async (req, res) => {
       return res.status(400).json({ message: "Chat ID is required" });
     }
 
-    const result = await Chat.findOneAndDelete({ userId, chatId });
+    const result = await executeDbOperation(async () => {
+      return await Chat.findOneAndDelete({ userId, chatId });
+    });
 
     if (!result) {
       return res.status(404).json({ message: "Chat not found" });
@@ -691,16 +763,20 @@ exports.getServiceStatus = async (req, res) => {
 
   try {
     const metrics = getServiceMetrics();
-    const dbStats = {
-      chatCount: await Chat.countDocuments(),
-      avgChatSize: await Chat.aggregate([
-        { $project: { messageCount: { $size: "$messages" } } },
-        { $group: { _id: null, avg: { $avg: "$messageCount" } } }
-      ]).then(result => result[0]?.avg || 0),
-      recentActivity: await Chat.countDocuments({
-        updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
-      })
-    };
+    const dbStatus = dbConnection.getConnectionStatus();
+
+    const dbStats = await executeDbOperation(async () => {
+      return {
+        chatCount: await Chat.countDocuments(),
+        avgChatSize: await Chat.aggregate([
+          { $project: { messageCount: { $size: "$messages" } } },
+          { $group: { _id: null, avg: { $avg: "$messageCount" } } }
+        ]).then(result => result[0]?.avg || 0),
+        recentActivity: await Chat.countDocuments({
+          updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+        })
+      };
+    });
 
     const systemLoad = {
       cpuUsage: process.cpuUsage(),
@@ -716,7 +792,10 @@ exports.getServiceStatus = async (req, res) => {
         ...metrics.caches
       },
       performance: metrics.performance,
-      database: dbStats,
+      database: {
+        ...dbStats,
+        connection: dbStatus
+      },
       system: systemLoad,
       aiService: metrics.api
     });

@@ -5,7 +5,7 @@ const config = {
     nodeEnv: process.env.NODE_ENV || 'development',
 
     mongodb: {
-        uri: process.env.MONGODB_URI,
+        uri: process.env.MONGO_URI,
         options: {
             useNewUrlParser: true,
             useUnifiedTopology: true
