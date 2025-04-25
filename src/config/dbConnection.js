@@ -3,20 +3,19 @@ const mongoose = require('mongoose');
 class MongoConnectionManager {
     constructor(uri, options = {}) {
         this.uri = uri;
-        this.options = {
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
-            serverSelectionTimeoutMS: 5000,
-            socketTimeoutMS: 45000,
-            ...options
-        };
-        this.isConnected = false;
-        this.reconnectTimer = null;
-        this.pingInterval = null;
         this.pingIntervalTime = options.pingIntervalTime || 30000;
         this.maxReconnectAttempts = options.maxReconnectAttempts || 10;
         this.reconnectAttempts = 0;
         this.reconnectInterval = options.reconnectInterval || 5000;
+        this.options = {
+            useNewUrlParser: true,
+            useUnifiedTopology: true,
+            serverSelectionTimeoutMS: options.serverSelectionTimeoutMS || 5000,
+            socketTimeoutMS: options.socketTimeoutMS || 45000,
+        };
+        this.isConnected = false;
+        this.reconnectTimer = null;
+        this.pingInterval = null;
 
         mongoose.connection.on('connected', () => this._handleConnected());
         mongoose.connection.on('disconnected', () => this._handleDisconnected());
@@ -186,7 +185,9 @@ const connectionManager = new MongoConnectionManager(
     {
         pingIntervalTime: 30000,
         maxReconnectAttempts: 50,
-        reconnectInterval: 3000
+        reconnectInterval: 3000,
+        serverSelectionTimeoutMS: 5000,
+        socketTimeoutMS: 45000
     }
 );
 
