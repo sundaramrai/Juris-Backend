@@ -7,6 +7,8 @@ const path = require('path');
 const { errorMiddleware } = require('./middleware/errorHandler');
 const rateLimiter = require('./middleware/rateLimiter');
 const dbManager = require('./utils/dbManager');
+const dbConnection = require('./config/dbConnection');
+const routes = require('./routes');
 
 const chatRoutes = require('./routes/chat');
 const healthCheckRoutes = require('./routes/healthCheck');
@@ -36,15 +38,21 @@ app.use((req, res, next) => {
 
 app.use(errorMiddleware);
 
+dbConnection.connect()
+    .then(() => console.log('Initial MongoDB connection successful'))
+    .catch(err => console.error('Initial MongoDB connection failed:', err));
+
 process.on('SIGINT', async () => {
     console.log('Received SIGINT. Shutting down gracefully...');
     await dbManager.disconnect();
+    await dbConnection.disconnect();
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
     console.log('Received SIGTERM. Shutting down gracefully...');
     await dbManager.disconnect();
+    await dbConnection.disconnect();
     process.exit(0);
 });
 
