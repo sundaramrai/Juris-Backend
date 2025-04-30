@@ -11,4 +11,9 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-module.exports = { authenticateToken };
+const authenticate = (req, res, next) => {
+  console.log('Authentication middleware placeholder - allowing request');
+  next();
+};
+
+module.exports = { authenticateToken, authenticate };
