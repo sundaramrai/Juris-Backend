@@ -1,194 +1,165 @@
 const mongoose = require('mongoose');
+const os = require('os');
 
-class MongoConnectionManager {
-    constructor(uri, options = {}) {
-        this.uri = uri;
-        this.pingIntervalTime = options.pingIntervalTime || 30000;
-        this.maxReconnectAttempts = options.maxReconnectAttempts || 10;
-        this.reconnectAttempts = 0;
-        this.reconnectInterval = options.reconnectInterval || 5000;
-        this.options = {
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
-            serverSelectionTimeoutMS: options.serverSelectionTimeoutMS || 5000,
-            socketTimeoutMS: options.socketTimeoutMS || 45000,
+class DatabaseConnection {
+    constructor() {
+        this.connection = null;
+        this.connectionStatus = {
+            isConnected: false,
+            lastConnectedAt: null,
+            lastDisconnectedAt: null,
+            connectionAttempts: 0,
+            reconnections: 0,
+            errors: []
         };
-        this.isConnected = false;
-        this.reconnectTimer = null;
-        this.pingInterval = null;
-
-        mongoose.connection.on('connected', () => this._handleConnected());
-        mongoose.connection.on('disconnected', () => this._handleDisconnected());
-        mongoose.connection.on('error', (err) => this._handleError(err));
+        this.errorHistory = [];
+        this.maxErrorHistoryLength = 10;
     }
 
     async connect() {
-        if (mongoose.connection.readyState === 1) {
-            console.log('MongoDB already connected');
-            this.isConnected = true;
-            this._startPing();
-            return mongoose.connection;
-        }
+        const uri = process.env.MONGO_URI;
 
+        if (!uri) {
+            throw new Error('MONGO_URI environment variable is not defined');
+        }
         try {
-            console.log('Connecting to MongoDB...');
-            await mongoose.connect(this.uri, this.options);
-            console.log('MongoDB connection established');
-            return mongoose.connection;
+            this.connectionStatus.connectionAttempts++;
+            const POOL_SIZE = process.env.MONGO_POOL_SIZE || Math.max(5, Math.min(10, os.cpus().length * 2));
+            console.log(`Connecting to MongoDB with pool size: ${POOL_SIZE}`);
+
+            if (this.connection) {
+                return this.connection;
+            }
+
+            mongoose.connection.on('connected', () => {
+                this.connectionStatus.isConnected = true;
+                this.connectionStatus.lastConnectedAt = new Date();
+                console.log('MongoDB connected successfully');
+            });
+
+            mongoose.connection.on('disconnected', () => {
+                this.connectionStatus.isConnected = false;
+                this.connectionStatus.lastDisconnectedAt = new Date();
+                console.log('MongoDB disconnected');
+            });
+
+            mongoose.connection.on('error', (err) => {
+                this.logError(err);
+                console.error('MongoDB connection error:', err);
+            });
+
+            mongoose.connection.on('reconnected', () => {
+                this.connectionStatus.reconnections++;
+                this.connectionStatus.isConnected = true;
+                this.connectionStatus.lastConnectedAt = new Date();
+                console.log('MongoDB reconnected successfully');
+            });
+
+            await mongoose.connect(uri, {
+                maxPoolSize: POOL_SIZE,
+                minPoolSize: Math.max(2, Math.floor(POOL_SIZE / 4)),
+                connectTimeoutMS: 30000,
+                socketTimeoutMS: 45000,
+                serverSelectionTimeoutMS: 5000,
+                heartbeatFrequencyMS: 10000,
+                retryWrites: true,
+                retryReads: true,
+                writeConcern: { w: 'majority' },
+                readPreference: 'primaryPreferred'
+            });
+
+            this.connection = mongoose.connection;
+            return this.connection;
         } catch (error) {
-            console.error('MongoDB connection error:', error);
-            this._scheduleReconnect();
+            this.logError(error);
+            console.error('Database connection error:', error);
             throw error;
         }
     }
 
-    async disconnect() {
-        this._stopPing();
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        if (mongoose.connection.readyState !== 0) {
-            await mongoose.disconnect();
-            console.log('MongoDB disconnected');
-        }
-    }
+    logError(error) {
+        const errorInfo = {
+            message: error.message,
+            name: error.name,
+            timestamp: new Date(),
+            stack: error.stack
+        };
 
-    async _ping() {
-        if (mongoose.connection.readyState !== 1) {
-            console.warn('Ping failed: MongoDB not connected');
-            return;
+        this.errorHistory.unshift(errorInfo);
+
+        if (this.errorHistory.length > this.maxErrorHistoryLength) {
+            this.errorHistory.pop();
         }
 
-        try {
-            await mongoose.connection.db.admin().ping();
-        } catch (error) {
-            console.error('MongoDB ping failed:', error);
-            if (this.isConnected) {
-                this._handleDisconnected();
-            }
-        }
-    }
-
-    _startPing() {
-        if (this.pingInterval) {
-            return;
-        }
-
-        this.pingInterval = setInterval(() => {
-            this._ping().catch(err => {
-                console.error('Error during MongoDB ping:', err);
-            });
-        }, this.pingIntervalTime);
-    }
-
-    _stopPing() {
-        if (this.pingInterval) {
-            clearInterval(this.pingInterval);
-            this.pingInterval = null;
-        }
-    }
-
-    _handleConnected() {
-        this.isConnected = true;
-        this.reconnectAttempts = 0;
-        console.log('MongoDB connection established');
-        this._startPing();
-    }
-
-    _handleDisconnected() {
-        const wasConnected = this.isConnected;
-        this.isConnected = false;
-
-        this._stopPing();
-
-        if (wasConnected) {
-            console.warn('MongoDB disconnected');
-        }
-
-        this._scheduleReconnect();
-    }
-
-    _handleError(error) {
-        console.error('MongoDB connection error:', error);
-        if (this.isConnected) {
-            this._handleDisconnected();
-        }
-    }
-
-    _scheduleReconnect() {
-        if (this.reconnectTimer) {
-            return;
-        }
-
-        this.reconnectAttempts++;
-
-        if (this.reconnectAttempts > this.maxReconnectAttempts) {
-            console.error(`Failed to reconnect to MongoDB after ${this.maxReconnectAttempts} attempts`);
-            return;
-        }
-
-        const delay = this.reconnectInterval * Math.min(Math.pow(2, this.reconnectAttempts - 1), 10);
-
-        console.info(`Scheduling MongoDB reconnection in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-
-        this.reconnectTimer = setTimeout(async () => {
-            this.reconnectTimer = null;
-
-            try {
-                if (mongoose.connection.readyState === 0) {
-                    console.info('Attempting to reconnect to MongoDB...');
-                    await mongoose.connect(this.uri, this.options);
-                    console.info('MongoDB reconnection successful');
-                } else if (mongoose.connection.readyState === 1) {
-                    console.info('MongoDB already reconnected');
-                    this._handleConnected();
-                } else {
-                    console.warn(`MongoDB in state ${mongoose.connection.readyState}, forcing reconnect`);
-                    try {
-                        await mongoose.disconnect();
-                    } catch (err) {
-                        console.warn("Error during disconnect:", err.message);
-                    }
-                    await mongoose.connect(this.uri, this.options);
-                }
-            } catch (error) {
-                console.error('MongoDB reconnection error:', error);
-                this._scheduleReconnect();
-            }
-        }, delay);
+        this.connectionStatus.errors = this.errorHistory.map(e => ({
+            message: e.message,
+            timestamp: e.timestamp
+        }));
     }
 
     getConnectionStatus() {
         return {
-            isConnected: this.isConnected,
-            readyState: mongoose.connection.readyState,
-            reconnectAttempts: this.reconnectAttempts,
-            reconnectScheduled: !!this.reconnectTimer,
-            stateDescription: this._getReadyStateDescription(mongoose.connection.readyState)
+            ...this.connectionStatus,
+            readyState: this.connection ? this.connection.readyState : 0,
+            readyStateText: this.getReadyStateText(),
+            database: this.connection ? this.connection.name : null,
+            host: this.connection ? this.connection.host : null,
+            errorCount: this.errorHistory.length
         };
     }
 
-    _getReadyStateDescription(state) {
+    getReadyStateText() {
         const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
-        return states[state] || 'unknown';
+        return states[this.connection ? this.connection.readyState : 0];
+    }
+
+    async createIndexes() {
+        if (!this.connection || this.connection.readyState !== 1) {
+            throw new Error('Database not connected');
+        }
+
+        try {
+            const collections = await this.connection.db.listCollections().toArray();
+            const collectionNames = collections.map(c => c.name);
+
+            if (collectionNames.includes('chats')) {
+                console.log('Creating indexes for improved query performance...');
+                await this.connection.db.collection('chats').createIndex({ userId: 1, createdAt: -1 });
+                await this.connection.db.collection('chats').createIndex({ sessionId: 1 });
+                await this.connection.db.collection('chats').createIndex({ updatedAt: -1 });
+                await this.connection.db.collection('chats').createIndex({ title: 'text' });
+                console.log('Indexes created successfully');
+            }
+
+            if (collectionNames.includes('users')) {
+                console.log('Creating indexes for users collection...');
+                await this.connection.db.collection('users').createIndex({ email: 1 }, { unique: true });
+                await this.connection.db.collection('users').createIndex({ username: 1 });
+                console.log('User indexes created successfully');
+            }
+        } catch (error) {
+            console.error('Error creating indexes:', error);
+            this.logError(error);
+            throw error;
+        }
+    }
+
+    async closeConnection() {
+        if (this.connection) {
+            try {
+                await mongoose.disconnect();
+                this.connection = null;
+                this.connectionStatus.isConnected = false;
+                this.connectionStatus.lastDisconnectedAt = new Date();
+                console.log('MongoDB connection closed');
+            } catch (error) {
+                this.logError(error);
+                console.error('Error closing MongoDB connection:', error);
+                throw error;
+            }
+        }
     }
 }
 
-const connectionUri = process.env.MONGO_URI;
-if (!connectionUri) {
-    console.error('MONGO_URI environment variable is not set!');
-}
-
-const connectionManager = new MongoConnectionManager(
-    connectionUri,
-    {
-        pingIntervalTime: 30000,
-        maxReconnectAttempts: 50,
-        reconnectInterval: 3000,
-        serverSelectionTimeoutMS: 5000,
-        socketTimeoutMS: 45000
-    }
-);
-
-module.exports = connectionManager;
+const dbConnection = new DatabaseConnection();
+module.exports = dbConnection;
