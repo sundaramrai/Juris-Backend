@@ -14,201 +14,8 @@ const {
 } = require("../services/aiService");
 const lockManager = require('../utils/lockManager');
 const dbConnection = require('../config/dbConnection');
+const cacheService = require('../services/cacheService');
 
-class LRUCache {
-  constructor(maxSize = 100, ttlMs = 15 * 60 * 1000, maxMemoryMB = 100) {
-    this.cache = new Map();
-    this.maxSize = maxSize;
-    this.ttlMs = ttlMs;
-    this.maxMemoryMB = maxMemoryMB;
-    this.estimatedMemoryUsage = 0;
-    this.stats = {
-      hits: 0,
-      misses: 0,
-      evictions: 0
-    };
-    this.accessFrequency = new Map();
-    this.lastCleanup = Date.now();
-    this.lastCleanupTime = Date.now();
-    this.cleanupInterval = 60 * 1000;
-    this.hitCount = 0;
-    this.missCount = 0;
-  }
-
-  get(key) {
-    const now = Date.now();
-    this._checkCleanup(now);
-
-    if (!this.has(key)) {
-      this.missCount++;
-      return undefined;
-    }
-
-    const item = this.cache.get(key);
-    if (item.expiry < now) {
-      this.delete(key);
-      this.missCount++;
-      return undefined;
-    }
-
-    this.cache.delete(key);
-    this.cache.set(key, item);
-    this.hitCount++;
-    return item.value;
-  }
-
-  set(key, value) {
-    const now = Date.now();
-    this._checkCleanup(now);
-
-    const itemSize = this._estimateObjectSize(value);
-    while (this.estimatedMemoryUsage + itemSize > this.maxMemoryMB * 1024 * 1024 && this.cache.size > 0) {
-      this._evictLeastUsed();
-    }
-
-    const expiry = now + this.ttlMs;
-    this.cache.set(key, { value, expiry, size: itemSize });
-    this.estimatedMemoryUsage += itemSize;
-
-    if (this.cache.size > this.maxSize) {
-      this._evictLeastUsed();
-    }
-
-    return true;
-  }
-
-  delete(key) {
-    this.accessFrequency.delete(key);
-    return this.cache.delete(key);
-  }
-
-  has(key) {
-    const now = Date.now();
-    this._checkCleanup(now);
-
-    if (!this.cache.has(key)) return false;
-    const item = this.cache.get(key);
-    if (now > item.expiry) {
-      this.cache.delete(key);
-      this.accessFrequency.delete(key);
-      this.stats.evictions++;
-      return false;
-    }
-    return true;
-  }
-
-  clear() {
-    this.cache.clear();
-    this.accessFrequency.clear();
-  }
-
-  keys() {
-    return this.cache.keys();
-  }
-
-  get size() {
-    return this.cache.size;
-  }
-
-  getStats() {
-    return {
-      ...this.stats,
-      size: this.cache.size,
-      hitRate: this.stats.hits + this.stats.misses > 0
-        ? (this.stats.hits / (this.stats.hits + this.stats.misses)) * 100
-        : 0,
-      memoryEstimate: this._estimateMemoryUsage(),
-      maxSize: this.maxSize,
-      memoryUsage: `${(this.estimatedMemoryUsage / (1024 * 1024)).toFixed(2)} MB`,
-      maxMemory: `${this.maxMemoryMB} MB`,
-      hitRate: this.hitCount + this.missCount === 0 ? 0 : this.hitCount / (this.hitCount + this.missCount),
-      hitCount: this.hitCount,
-      missCount: this.missCount
-    };
-  }
-
-  _evictLeastUsed() {
-    let leastUsedKey = null;
-    let lowestFrequency = Infinity;
-
-    for (const [key, frequency] of this.accessFrequency.entries()) {
-      if (frequency < lowestFrequency && this.cache.has(key)) {
-        lowestFrequency = frequency;
-        leastUsedKey = key;
-      }
-    }
-
-    if (leastUsedKey) {
-      this.cache.delete(leastUsedKey);
-      this.accessFrequency.delete(leastUsedKey);
-      this.stats.evictions++;
-    } else {
-      const oldestKey = this.cache.keys().next().value;
-      this.cache.delete(oldestKey);
-      this.accessFrequency.delete(oldestKey);
-      this.stats.evictions++;
-    }
-  }
-
-  _checkCleanup(now) {
-    if (now - this.lastCleanup > this.cleanupInterval) {
-      this._cleanup(now);
-      this.lastCleanup = now;
-    }
-    if (now - this.lastCleanupTime > this.cleanupInterval) {
-      this._cleanup(now);
-      this.lastCleanupTime = now;
-    }
-  }
-
-  _cleanup(now) {
-    const expiredKeys = [];
-
-    for (const [key, item] of this.cache.entries()) {
-      if (now > item.expiry) {
-        expiredKeys.push(key);
-      }
-    }
-
-    expiredKeys.forEach(key => {
-      this.cache.delete(key);
-      this.accessFrequency.delete(key);
-      this.stats.evictions++;
-    });
-
-    let freedMemory = 0;
-    let removedCount = 0;
-
-    for (const [key, item] of this.cache.entries()) {
-      if (item.expiry < now) {
-        freedMemory += item.size;
-        removedCount++;
-        this.cache.delete(key);
-      }
-    }
-
-    this.estimatedMemoryUsage -= freedMemory;
-    if (removedCount > 0) {
-      console.log(`Cache cleanup: removed ${removedCount} expired items, freed ${(freedMemory / (1024 * 1024)).toFixed(2)} MB`);
-    }
-    if (this.estimatedMemoryUsage < 0) this.estimatedMemoryUsage = 0;
-  }
-
-  _estimateMemoryUsage() {
-    let total = 0;
-    for (const item of this.cache.values()) {
-      total += item.size || 0;
-    }
-    return total;
-  }
-
-  _estimateObjectSize(obj) {
-    const stringify = JSON.stringify(obj);
-    return stringify ? stringify.length * 2 : 0;
-  }
-}
-
-const chatCache = new LRUCache(100, 15 * 60 * 1000);
 const handleError = (res, error, message, statusCode = 500) => {
   const errorType = error.name || 'GeneralError';
   const errorId = uuidv4().substring(0, 8);
@@ -231,22 +38,39 @@ const handleError = (res, error, message, statusCode = 500) => {
   });
 };
 
-const getCachedChat = (userId, chatId) => {
-  const key = `${userId}:${chatId}`;
-  return chatCache.get(key);
-};
+async function getChatResponse(query, userId, sessionId) {
+  const cacheKey = `response:${query.toLowerCase().trim()}`;
 
-const setCachedChat = (userId, chatId, data) => {
-  const key = `${userId}:${chatId}`;
-  return chatCache.set(key, data);
-};
-
-const invalidateUserChatCache = (userId) => {
-  for (const key of chatCache.keys()) {
-    if (key.startsWith(`${userId}:`)) {
-      chatCache.delete(key);
+  try {
+    const cachedResponse = await cacheService.get(cacheKey, 'chat');
+    if (cachedResponse) {
+      console.log('Cache hit for query');
+      return cachedResponse;
     }
+
+    console.log('Cache miss for query, generating response');
+    const result = await processQuery(query);
+    await cacheService.set(cacheKey, result, 3600, 'chat');
+
+    return result;
+  } catch (error) {
+    console.error('Error getting chat response:', error);
+    throw error;
   }
+}
+
+const getCachedChat = async (userId, chatId) => {
+  const key = `${userId}:${chatId}`;
+  return await cacheService.get(key, 'chat');
+};
+
+const setCachedChat = async (userId, chatId, data) => {
+  const key = `${userId}:${chatId}`;
+  return await cacheService.set(key, data, 3600, 'chat');
+};
+
+const invalidateUserChatCache = async (userId) => {
+  await cacheService.flush(`chat:user:${userId}`);
 };
 
 const batchDecryptMessages = (messages) => {
@@ -340,7 +164,7 @@ exports.processChat = async (req, res) => {
 
     let chat;
     if (chatId) {
-      chat = getCachedChat(userId, chatId);
+      chat = await getCachedChat(userId, chatId);
       if (!chat) {
         chat = await executeDbOperation(async () => {
           return await Chat.findOne({ userId, chatId }).maxTimeMS(5000);
@@ -404,8 +228,8 @@ exports.processChat = async (req, res) => {
       }
     });
 
-    invalidateUserChatCache(userId);
-    setCachedChat(userId, chat.chatId, chat);
+    await invalidateUserChatCache(userId);
+    await setCachedChat(userId, chat.chatId, chat);
 
     res.json({
       chatId: chat.chatId,
@@ -553,7 +377,7 @@ exports.getAllChats = async (req, res) => {
         totalPages: Math.ceil(totalDocs / limit),
         totalChats: totalDocs
       },
-      cacheStats: chatCache.getStats()
+      cacheStats: cacheService.getStats()
     });
   } catch (error) {
     return handleError(res, error, "Error fetching all chats");
@@ -568,13 +392,13 @@ exports.getChatHistory = async (req, res) => {
     if (!chatId) {
       return res.status(400).json({ message: "Chat ID is required" });
     }
-    let chat = getCachedChat(userId, chatId);
+    let chat = await getCachedChat(userId, chatId);
     if (!chat) {
       chat = await executeDbOperation(async () => {
         return await Chat.findOne({ userId, chatId });
       });
       if (chat) {
-        setCachedChat(userId, chatId, chat);
+        await setCachedChat(userId, chatId, chat);
       }
     }
 
@@ -721,8 +545,8 @@ exports.updateChatTitle = async (req, res) => {
       return res.status(404).json({ message: "Chat not found" });
     }
 
-    if (getCachedChat(userId, chatId)) {
-      setCachedChat(userId, chatId, chat);
+    if (await getCachedChat(userId, chatId)) {
+      await setCachedChat(userId, chatId, chat);
     }
 
     res.json({ chatId: chat.chatId, title: chat.title });
@@ -748,7 +572,7 @@ exports.deleteChat = async (req, res) => {
       return res.status(404).json({ message: "Chat not found" });
     }
     const key = `${userId}:${chatId}`;
-    chatCache.delete(key);
+    await cacheService.del(key, 'chat');
 
     res.json({ message: "Chat deleted successfully", chatId });
   } catch (error) {
@@ -788,7 +612,7 @@ exports.getServiceStatus = async (req, res) => {
     res.json({
       status: "operational",
       cacheStatus: {
-        chatCache: chatCache.getStats(),
+        chatCache: cacheService.getStats(),
         ...metrics.caches
       },
       performance: metrics.performance,
@@ -801,5 +625,28 @@ exports.getServiceStatus = async (req, res) => {
     });
   } catch (error) {
     return handleError(res, error, "Error fetching service status");
+  }
+};
+
+exports.clearUserCache = async function (req, res) {
+  try {
+    const userId = req.params.userId;
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    await cacheService.flush(`chat:user:${userId}`);
+    return res.status(200).json({ message: 'Cache cleared successfully' });
+  } catch (error) {
+    handleError(res, error, 'Error clearing user cache');
+  }
+};
+
+exports.getCacheStats = async function (req, res) {
+  try {
+    const stats = cacheService.getStats();
+    return res.status(200).json(stats);
+  } catch (error) {
+    handleError(res, error, 'Error getting cache statistics');
   }
 };
