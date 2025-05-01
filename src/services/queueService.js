@@ -1,3 +1,4 @@
+// src/services/queueService.js
 const { EventEmitter } = require('events');
 const Queue = require('bull');
 const Redis = require('ioredis');

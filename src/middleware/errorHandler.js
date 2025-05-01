@@ -1,6 +1,4 @@
-/**
- * Global error handling middleware
- */
+// src/config/dbConnection.js
 class ErrorHandler {
     constructor() {
         this.errorLog = [];

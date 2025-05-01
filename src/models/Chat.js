@@ -1,3 +1,4 @@
+// src/models/Chat.js
 const mongoose = require("mongoose");
 
 const chatSchema = new mongoose.Schema({
@@ -42,7 +43,7 @@ const chatSchema = new mongoose.Schema({
   }
 });
 
-chatSchema.pre("save", function(next) {
+chatSchema.pre("save", function (next) {
   this.updatedAt = new Date();
   next();
 });
