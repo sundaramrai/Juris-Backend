@@ -313,6 +313,7 @@ class AdvancedPerformanceCache {
         try {
           valueSize = JSON.stringify(entry.value).length * 2;
         } catch (e) {
+          console.warn(`Unable to stringify object for memory estimation: ${e.message}`);
           valueSize = 500;
         }
       }
@@ -894,7 +895,14 @@ async function checkGeminiApiStatus() {
     geminiApiStatus.consecutiveFailures++;
     geminiApiStatus.retryAfter = Math.min(300000, 60000 * Math.pow(1.5, geminiApiStatus.consecutiveFailures - 1));
 
-    console.error(`Gemini API unavailable (failure #${geminiApiStatus.consecutiveFailures}). Will retry after ${geminiApiStatus.retryAfter / 1000} seconds`);
+    console.error(`Gemini API unavailable (failure #${geminiApiStatus.consecutiveFailures}). Will retry after ${geminiApiStatus.retryAfter / 1000} seconds. Error: ${error.message}`);
+
+    if (!connectionHealth) {
+      connectionHealth.totalErrors = (connectionHealth.totalErrors || 0) + 1;
+      const errorType = error.code || (error.message?.includes('fetch failed') ? 'FETCH_FAILED' : 'UNKNOWN');
+      connectionHealth.errorTypes = connectionHealth.errorTypes || {};
+      connectionHealth.errorTypes[errorType] = (connectionHealth.errorTypes[errorType] || 0) + 1;
+    }
     return false;
   }
 }
@@ -1241,14 +1249,20 @@ function analyzeQueryCharacteristics(query) {
   const isMedium = wordCount > 5 && wordCount <= 15;
   const isLong = wordCount > 15;
   const hasNumbers = /\d+/.test(query);
-  const hasSpecialSymbols = /[@#$%^&*()_+\-=\[\]{};':"\\|,<>\/?]/.test(query);
+  const hasSpecialSymbols = /[@#$%^&*()_+\-=[\]{};':"\\|,<>/?]/.test(query);
   const hasMultipleQuestions = (query.match(/\?/g) || []).length > 1;
   const endsWithQuestion = query.trim().endsWith('?');
   const startsWithGreeting = GREETING_REGEX.test(query.toLowerCase());
   const containsPlease = /please/i.test(query);
   const hasMultipleSentences = query.split(/[.!?]+/).filter(s => s.trim().length > 0).length > 1;
   const hasAllCaps = /[A-Z]{3,}/.test(query);
-  const formality = containsPlease ? 'formal' : (hasAllCaps ? 'urgent' : 'neutral');
+
+  let formality = 'neutral';
+  if (containsPlease) {
+    formality = 'formal';
+  } else if (hasAllCaps) {
+    formality = 'urgent';
+  }
 
   return {
     length,
