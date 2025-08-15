@@ -114,7 +114,7 @@ class LRUCache {
     return {
       ...this.stats,
       size: this.cache.size,
-      hitRate: this.stats.hits + this.stats.misses > 0
+      hitRatePercent: this.stats.hits + this.stats.misses > 0
         ? (this.stats.hits / (this.stats.hits + this.stats.misses)) * 100
         : 0,
       memoryEstimate: this._estimateMemoryUsage(),
@@ -493,6 +493,7 @@ exports.getAllChats = async (req, res) => {
           try {
             chatItem.summary = decryptText(chat.chatSummary);
           } catch (e) {
+            console.error("Failed to decrypt chat summary:", e);
             chatItem.summary = "Summary unavailable";
           }
         } else {
@@ -588,9 +589,11 @@ exports.getChatHistory = async (req, res) => {
           text: decryptText(m.text)
         };
       } catch (e) {
+        console.error(`Error decrypting message: ${e.message}`);
         return {
           ...m.toObject ? m.toObject() : m,
-          text: "Message couldn't be decrypted"
+          text: "Message couldn't be decrypted",
+          decryptionError: process.env.NODE_ENV === 'development' ? e.message : 'Decryption failed'
         };
       }
     });
@@ -600,6 +603,7 @@ exports.getChatHistory = async (req, res) => {
       try {
         decodedSummary = decryptText(chat.chatSummary);
       } catch (e) {
+        console.error("Error decrypting chat summary:", e);
         decodedSummary = "Summary unavailable";
       }
     }
