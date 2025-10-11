@@ -1,4 +1,3 @@
-// src/controllers/chatController.js
 const mongoose = require('mongoose');
 const Chat = require("../models/Chat");
 const { v4: uuidv4 } = require("uuid");
@@ -9,101 +8,114 @@ const {
   processQuery,
   getServiceMetrics,
   withRetry,
-  batchProcessQueries,
   prioritizeQuery
 } = require("../services/aiService");
 const lockManager = require('../utils/lockManager');
 const dbConnection = require('../config/dbConnection');
 
 class LRUCache {
-  constructor(maxSize = 100, ttlMs = 15 * 60 * 1000, maxMemoryMB = 100) {
+  constructor(options = {}) {
     this.cache = new Map();
-    this.maxSize = maxSize;
-    this.ttlMs = ttlMs;
-    this.maxMemoryMB = maxMemoryMB;
-    this.estimatedMemoryUsage = 0;
-    this.stats = {
+    this.config = {
+      maxSize: options.maxSize || 100,
+      ttlMs: options.ttlMs || 15 * 60 * 1000,
+      maxMemoryMB: options.maxMemoryMB || 100,
+      cleanupIntervalMs: options.cleanupIntervalMs || 60 * 1000
+    };
+
+    this.metrics = {
       hits: 0,
       misses: 0,
-      evictions: 0
+      evictions: 0,
+      estimatedMemoryBytes: 0
     };
-    this.accessFrequency = new Map();
+
     this.lastCleanup = Date.now();
-    this.lastCleanupTime = Date.now();
-    this.cleanupInterval = 60 * 1000;
-    this.hitCount = 0;
-    this.missCount = 0;
   }
 
   get(key) {
     const now = Date.now();
-    this._checkCleanup(now);
+    this._maybeCleanup(now);
 
-    if (!this.has(key)) {
-      this.missCount++;
+    const item = this.cache.get(key);
+
+    if (!item) {
+      this.metrics.misses++;
       return undefined;
     }
 
-    const item = this.cache.get(key);
     if (item.expiry < now) {
-      this.delete(key);
-      this.missCount++;
+      this._removeItem(key);
+      this.metrics.misses++;
       return undefined;
     }
 
     this.cache.delete(key);
     this.cache.set(key, item);
-    this.hitCount++;
+    this.metrics.hits++;
+
     return item.value;
   }
 
   set(key, value) {
     const now = Date.now();
-    this._checkCleanup(now);
+    this._maybeCleanup(now);
 
-    const itemSize = this._estimateObjectSize(value);
-    while (this.estimatedMemoryUsage + itemSize > this.maxMemoryMB * 1024 * 1024 && this.cache.size > 0) {
-      this._evictLeastUsed();
+    const itemSize = this._estimateSize(value);
+
+    while (
+      this.metrics.estimatedMemoryBytes + itemSize > this.config.maxMemoryMB * 1024 * 1024 &&
+      this.cache.size > 0
+    ) {
+      this._evictOldest();
     }
 
-    const expiry = now + this.ttlMs;
-    this.cache.set(key, { value, expiry, size: itemSize });
-    this.estimatedMemoryUsage += itemSize;
+    const existingItem = this.cache.get(key);
+    if (existingItem) {
+      this.metrics.estimatedMemoryBytes -= existingItem.size;
+    }
 
-    if (this.cache.size > this.maxSize) {
-      this._evictLeastUsed();
+    const item = {
+      value,
+      expiry: now + this.config.ttlMs,
+      size: itemSize
+    };
+
+    this.cache.set(key, item);
+    this.metrics.estimatedMemoryBytes += itemSize;
+
+    if (this.cache.size > this.config.maxSize) {
+      this._evictOldest();
     }
 
     return true;
   }
 
   delete(key) {
-    this.accessFrequency.delete(key);
-    return this.cache.delete(key);
+    return this._removeItem(key);
   }
 
   has(key) {
     const now = Date.now();
-    this._checkCleanup(now);
-
-    if (!this.cache.has(key)) return false;
     const item = this.cache.get(key);
-    if (now > item.expiry) {
-      this.cache.delete(key);
-      this.accessFrequency.delete(key);
-      this.stats.evictions++;
+
+    if (!item) return false;
+
+    if (item.expiry < now) {
+      this._removeItem(key);
       return false;
     }
+
     return true;
   }
 
   clear() {
     this.cache.clear();
-    this.accessFrequency.clear();
+    this.metrics.estimatedMemoryBytes = 0;
   }
 
   keys() {
-    return this.cache.keys();
+    return Array.from(this.cache.keys());
   }
 
   get size() {
@@ -111,207 +123,193 @@ class LRUCache {
   }
 
   getStats() {
+    const totalRequests = this.metrics.hits + this.metrics.misses;
+    const hitRate = totalRequests > 0 ? this.metrics.hits / totalRequests : 0;
+
     return {
-      ...this.stats,
       size: this.cache.size,
-      hitRatePercent: this.stats.hits + this.stats.misses > 0
-        ? (this.stats.hits / (this.stats.hits + this.stats.misses)) * 100
-        : 0,
-      memoryEstimate: this._estimateMemoryUsage(),
-      maxSize: this.maxSize,
-      memoryUsage: `${(this.estimatedMemoryUsage / (1024 * 1024)).toFixed(2)} MB`,
-      maxMemory: `${this.maxMemoryMB} MB`,
-      hitRate: this.hitCount + this.missCount === 0 ? 0 : this.hitCount / (this.hitCount + this.missCount),
-      hitCount: this.hitCount,
-      missCount: this.missCount
+      maxSize: this.config.maxSize,
+      hits: this.metrics.hits,
+      misses: this.metrics.misses,
+      evictions: this.metrics.evictions,
+      hitRate: hitRate,
+      hitRatePercent: (hitRate * 100).toFixed(2),
+      memoryUsageMB: (this.metrics.estimatedMemoryBytes / (1024 * 1024)).toFixed(2),
+      maxMemoryMB: this.config.maxMemoryMB
     };
   }
 
-  _evictLeastUsed() {
-    let leastUsedKey = null;
-    let lowestFrequency = Infinity;
-
-    for (const [key, frequency] of this.accessFrequency.entries()) {
-      if (frequency < lowestFrequency && this.cache.has(key)) {
-        lowestFrequency = frequency;
-        leastUsedKey = key;
-      }
-    }
-
-    if (leastUsedKey) {
-      this.cache.delete(leastUsedKey);
-      this.accessFrequency.delete(leastUsedKey);
-      this.stats.evictions++;
-    } else {
-      const oldestKey = this.cache.keys().next().value;
-      this.cache.delete(oldestKey);
-      this.accessFrequency.delete(oldestKey);
-      this.stats.evictions++;
-    }
-  }
-
-  _checkCleanup(now) {
-    if (now - this.lastCleanup > this.cleanupInterval) {
-      this._cleanup(now);
-      this.lastCleanup = now;
-    }
-    if (now - this.lastCleanupTime > this.cleanupInterval) {
-      this._cleanup(now);
-      this.lastCleanupTime = now;
-    }
-  }
-
-  _cleanup(now) {
-    const expiredKeys = [];
-
-    for (const [key, item] of this.cache.entries()) {
-      if (now > item.expiry) {
-        expiredKeys.push(key);
-      }
-    }
-
-    expiredKeys.forEach(key => {
+  _removeItem(key) {
+    const item = this.cache.get(key);
+    if (item) {
+      this.metrics.estimatedMemoryBytes -= item.size;
       this.cache.delete(key);
-      this.accessFrequency.delete(key);
-      this.stats.evictions++;
-    });
+      return true;
+    }
+    return false;
+  }
 
-    let freedMemory = 0;
+  _evictOldest() {
+    const oldestKey = this.cache.keys().next().value;
+    if (oldestKey) {
+      this._removeItem(oldestKey);
+      this.metrics.evictions++;
+    }
+  }
+
+  _maybeCleanup(now) {
+    if (now - this.lastCleanup < this.config.cleanupIntervalMs) {
+      return;
+    }
+
     let removedCount = 0;
+    let freedBytes = 0;
 
     for (const [key, item] of this.cache.entries()) {
       if (item.expiry < now) {
-        freedMemory += item.size;
-        removedCount++;
+        freedBytes += item.size;
         this.cache.delete(key);
+        removedCount++;
       }
     }
 
-    this.estimatedMemoryUsage -= freedMemory;
+    this.metrics.estimatedMemoryBytes -= freedBytes;
+    this.metrics.evictions += removedCount;
+    this.lastCleanup = now;
+
     if (removedCount > 0) {
-      console.log(`Cache cleanup: removed ${removedCount} expired items, freed ${(freedMemory / (1024 * 1024)).toFixed(2)} MB`);
+      console.log(
+        `Cache cleanup: removed ${removedCount} items, freed ${(freedBytes / (1024 * 1024)).toFixed(2)} MB`
+      );
     }
-    if (this.estimatedMemoryUsage < 0) this.estimatedMemoryUsage = 0;
   }
 
-  _estimateMemoryUsage() {
-    let total = 0;
-    for (const item of this.cache.values()) {
-      total += item.size || 0;
+  _estimateSize(obj) {
+    try {
+      return JSON.stringify(obj).length * 2;
+    } catch {
+      return 1024;
     }
-    return total;
-  }
-
-  _estimateObjectSize(obj) {
-    const stringify = JSON.stringify(obj);
-    return stringify ? stringify.length * 2 : 0;
   }
 }
 
-const chatCache = new LRUCache(100, 15 * 60 * 1000);
-const handleError = (res, error, message, statusCode = 500) => {
-  const errorType = error.name || 'GeneralError';
-  const errorId = uuidv4().substring(0, 8);
+const chatCache = new LRUCache({ maxSize: 100, ttlMs: 15 * 60 * 1000 });
 
-  console.error(`❌ [${errorId}] ${message} (${errorType}):`, error);
-  if (error.name === 'AIServiceError') {
-    statusCode = 503;
-    message = 'AI service temporarily unavailable';
-  } else if (error.name === 'ValidationError') {
-    statusCode = 400;
-  } else if (error.name === 'AuthorizationError') {
-    statusCode = 403;
+const handleError = (res, error, message, statusCode = 500) => {
+  const errorId = uuidv4().substring(0, 8);
+  const isDev = process.env.NODE_ENV === 'development';
+
+  console.error(`❌ [${errorId}] ${message}:`, error);
+
+  const errorMappings = {
+    AIServiceError: { code: 503, message: 'AI service temporarily unavailable' },
+    ValidationError: { code: 400, message: 'Validation failed' },
+    AuthorizationError: { code: 403, message: 'Unauthorized access' },
+    MongoNetworkError: { code: 503, message: 'Database temporarily unavailable' },
+    MongoTimeoutError: { code: 503, message: 'Database request timeout' }
+  };
+
+  const errorConfig = errorMappings[error.name];
+  if (errorConfig) {
+    statusCode = errorConfig.code;
+    message = errorConfig.message;
   }
 
   return res.status(statusCode).json({
     message,
     errorId,
-    errorType: process.env.NODE_ENV === 'development' ? errorType : undefined,
-    errorDetails: process.env.NODE_ENV === 'development' ? error.message : undefined
+    ...(isDev && {
+      errorType: error.name,
+      errorDetails: error.message,
+      stack: error.stack
+    })
   });
 };
 
+const getCacheKey = (userId, chatId) => `${userId}:${chatId}`;
+
 const getCachedChat = (userId, chatId) => {
-  const key = `${userId}:${chatId}`;
-  return chatCache.get(key);
+  return chatCache.get(getCacheKey(userId, chatId));
 };
 
 const setCachedChat = (userId, chatId, data) => {
-  const key = `${userId}:${chatId}`;
-  return chatCache.set(key, data);
+  return chatCache.set(getCacheKey(userId, chatId), data);
 };
 
-const invalidateUserChatCache = (userId) => {
-  for (const key of chatCache.keys()) {
-    if (key.startsWith(`${userId}:`)) {
-      chatCache.delete(key);
-    }
-  }
+const invalidateUserCache = (userId) => {
+  const prefix = `${userId}:`;
+  chatCache.keys()
+    .filter(key => key.startsWith(prefix))
+    .forEach(key => chatCache.delete(key));
 };
 
 const batchDecryptMessages = (messages) => {
-  if (!messages || !messages.length) return [];
-  const batchSize = 50;
-  const results = [];
+  if (!messages?.length) return [];
 
-  for (let i = 0; i < messages.length; i += batchSize) {
-    const batch = messages.slice(i, i + batchSize);
-    const decryptedBatch = batch.map(m => ({
-      ...m.toObject ? m.toObject() : m,
-      text: typeof m.text === 'string' ? decryptText(m.text) : m.text
-    }));
-    results.push(...decryptedBatch);
-  }
-
-  return results;
-};
-
-const ensureDbConnected = async () => {
-  if (mongoose.connection.readyState !== 1) {
-    console.warn(`MongoDB not connected (state: ${mongoose.connection.readyState}). Attempting to reconnect...`);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    if (mongoose.connection.readyState !== 1) {
-      try {
-        await dbConnection.connect();
-      } catch (connError) {
-        console.error("Reconnection attempt failed:", connError.message);
-      }
+  return messages.map(msg => {
+    try {
+      const msgObj = msg.toObject ? msg.toObject() : msg;
+      return {
+        ...msgObj,
+        text: typeof msgObj.text === 'string' ? decryptText(msgObj.text) : msgObj.text
+      };
+    } catch (error) {
+      console.error('Message decryption failed:', error.message);
+      return {
+        ...(msg.toObject ? msg.toObject() : msg),
+        text: '[Decryption failed]',
+        decryptionError: true
+      };
     }
-  }
+  });
 };
 
 const isConnectionError = (error) => {
-  return (
-    error.name === 'MongoNetworkError' ||
-    error.name === 'MongoTimeoutError' ||
-    (typeof error.message === 'string' && (
-      error.message.includes('topology') ||
-      error.message.includes('connection')
-    )) ||
-    error.name === 'MongoServerSelectionError'
-  );
+  const connectionErrors = [
+    'MongoNetworkError',
+    'MongoTimeoutError',
+    'MongoServerSelectionError'
+  ];
+
+  return connectionErrors.includes(error.name) ||
+    error.message?.includes('topology') ||
+    error.message?.includes('connection');
 };
 
-const handleRetry = async (retries) => {
-  await new Promise(resolve => setTimeout(resolve, 1000 * retries));
-  try {
-    await dbConnection.connect();
-  } catch (connError) {
-    console.error("Reconnection attempt failed:", connError.message);
+const ensureDbConnection = async () => {
+  if (mongoose.connection.readyState === 1) return;
+
+  console.warn(`MongoDB not connected (state: ${mongoose.connection.readyState}). Reconnecting...`);
+
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
+  if (mongoose.connection.readyState !== 1) {
+    try {
+      await dbConnection.connect();
+    } catch (error) {
+      console.error('Reconnection failed:', error.message);
+      throw error;
+    }
   }
 };
 
 const executeDbOperation = async (operation, maxRetries = 3) => {
-  let retries = 0;
-  while (retries < maxRetries) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      await ensureDbConnected();
+      await ensureDbConnection();
       return await operation();
     } catch (error) {
-      retries++;
-      if (isConnectionError(error) && retries < maxRetries) {
-        console.warn(`MongoDB operation failed due to connection issue. Retrying (${retries}/${maxRetries})...`);
-        await handleRetry(retries);
+      const isLastAttempt = attempt === maxRetries;
+
+      if (isConnectionError(error) && !isLastAttempt) {
+        console.warn(`DB operation failed. Retry ${attempt}/${maxRetries}...`);
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+
+        try {
+          await dbConnection.connect();
+        } catch (connError) {
+          console.error('Reconnection attempt failed:', connError.message);
+        }
       } else {
         throw error;
       }
@@ -319,27 +317,82 @@ const executeDbOperation = async (operation, maxRetries = 3) => {
   }
 };
 
+const generateChatTitle = (botResponse, classification, query) => {
+  if (classification.isLegal) {
+    const titleMatch = botResponse.match(/\*\*Title:\*\*\s*(.*?)(?:\n|$)/i) ||
+      botResponse.match(/^Title:\s*(.*?)(?:\n|$)/i);
+
+    if (titleMatch?.[1]) {
+      return titleMatch[1].trim().substring(0, 100);
+    }
+
+    if (classification.specificLaws?.length > 0) {
+      return `Query about ${classification.specificLaws[0]}`;
+    }
+
+    return `${classification.subCategory || 'Legal'} Query`;
+  }
+
+  if (query.length <= 50) {
+    return query;
+  }
+
+  return classification.category === 'general_chat'
+    ? 'General Conversation'
+    : `${classification.category.replace(/_/g, ' ')} Query`;
+};
+
+const warmCacheInBackground = (userId, chatIds) => {
+  if (!chatIds.length) return;
+
+  const BATCH_SIZE = 5;
+  const batches = [];
+
+  for (let i = 0; i < chatIds.length; i += BATCH_SIZE) {
+    batches.push(chatIds.slice(i, i + BATCH_SIZE));
+  }
+
+  batches.forEach((batch, index) => {
+    setTimeout(async () => {
+      try {
+        const chats = await executeDbOperation(async () => {
+          return await Chat.find({
+            userId,
+            chatId: { $in: batch }
+          }).maxTimeMS(10000);
+        });
+
+        chats.forEach(chat => setCachedChat(userId, chat.chatId, chat));
+      } catch (error) {
+        console.error('Cache warming error:', error.message);
+      }
+    }, index * 2000);
+  });
+};
+
 exports.processChat = async (req, res) => {
   try {
     const { message, chatId } = req.body;
     const userId = req.user.userId;
 
-    if (!message || message.trim() === '') {
+    if (!message?.trim()) {
       return res.status(400).json({ message: "Message is required and cannot be empty" });
     }
-    const priority = message.length < 200 ? await prioritizeQuery(message) : 'normal';
 
+    const priority = message.length < 200 ? await prioritizeQuery(message) : 'normal';
     const processingStart = Date.now();
+
     const { response: botResponse, classification: queryClassification } =
       await withRetry(() => processQuery(message), 3, 1000, true);
+
     const processingTime = Date.now() - processingStart;
 
-    const currentTime = new Date();
-    const userMessagePlain = { type: "user", text: message, time: currentTime };
-    const botMessagePlain = {
+    const timestamp = new Date();
+    const userMessage = { type: "user", text: message, time: timestamp };
+    const botMessage = {
       type: "bot",
       text: botResponse,
-      time: currentTime,
+      time: timestamp,
       metadata: {
         processingTime,
         classification: {
@@ -351,72 +404,70 @@ exports.processChat = async (req, res) => {
     };
 
     let chat;
+    let messageCount = 0;
+    let plainMessages = [];
+
     if (chatId) {
-      chat = getCachedChat(userId, chatId);
-      if (!chat) {
-        chat = await executeDbOperation(async () => {
-          return await Chat.findOne({ userId, chatId }).maxTimeMS(5000);
-        });
-      }
+      chat = getCachedChat(userId, chatId) ||
+        await executeDbOperation(() => Chat.findOne({ userId, chatId }).maxTimeMS(5000));
     }
 
-    let plainMessagesForSummary = [];
-    let messageCount = 0;
-
     if (chat) {
-      if (chat.messages) {
-        plainMessagesForSummary = batchDecryptMessages(chat.messages);
-        messageCount = chat.messages.length;
-      } else {
-        plainMessagesForSummary = [];
-        chat.messages = [];
-      }
+      plainMessages = batchDecryptMessages(chat.messages || []);
+      messageCount = chat.messages?.length || 0;
 
-      plainMessagesForSummary.push(userMessagePlain, botMessagePlain);
-      chat.messages.push({ type: "user", text: encryptText(message), time: currentTime });
-      chat.messages.push({ type: "bot", text: encryptText(botResponse), time: currentTime, metadata: botMessagePlain.metadata });
+      plainMessages.push(userMessage, botMessage);
+      chat.messages.push(
+        { type: "user", text: encryptText(message), time: timestamp },
+        { type: "bot", text: encryptText(botResponse), time: timestamp, metadata: botMessage.metadata }
+      );
     } else {
       const newChatId = chatId || uuidv4();
-      plainMessagesForSummary = [userMessagePlain, botMessagePlain];
+      plainMessages = [userMessage, botMessage];
+
       chat = new Chat({
         userId,
         chatId: newChatId,
         messages: [
-          { type: "user", text: encryptText(message), time: currentTime },
-          { type: "bot", text: encryptText(botResponse), time: currentTime, metadata: botMessagePlain.metadata }
+          { type: "user", text: encryptText(message), time: timestamp },
+          { type: "bot", text: encryptText(botResponse), time: timestamp, metadata: botMessage.metadata }
         ]
       });
     }
 
     if (!chat.title || chat.title === "New Chat") {
-      chat.title = await generateChatTitle(botResponse, queryClassification, message);
+      chat.title = generateChatTitle(botResponse, queryClassification, message);
     }
+
     let summaryPlain = "";
-    if (plainMessagesForSummary.length >= 4) {
-      summaryPlain = await generateChatSummary(plainMessagesForSummary);
-      chat.chatSummary = summaryPlain ? encryptText(summaryPlain) : "";
+    if (plainMessages.length >= 4) {
+      summaryPlain = await generateChatSummary(plainMessages);
+      if (summaryPlain) {
+        chat.chatSummary = encryptText(summaryPlain);
+      }
     }
-    const chatSavePromise = lockManager.withLock(chat._id.toString(), async () => {
+
+    const saveChatPromise = lockManager.withLock(chat._id.toString(), async () => {
       try {
         await executeDbOperation(async () => {
           const freshChat = await Chat.findById(chat._id);
           if (freshChat) {
-            freshChat.messages = chat.messages;
-            freshChat.lastActivity = chat.lastActivity;
-            freshChat.chatSummary = chat.chatSummary;
-            freshChat.title = chat.title;
+            Object.assign(freshChat, {
+              messages: chat.messages,
+              lastActivity: chat.lastActivity,
+              chatSummary: chat.chatSummary,
+              title: chat.title
+            });
             await freshChat.save();
           }
         });
       } catch (error) {
-        console.error("Error saving chat with lock:", error);
-        await executeDbOperation(async () => {
-          await chat.save();
-        });
+        console.error('Error saving with lock:', error.message);
+        await executeDbOperation(() => chat.save());
       }
     });
 
-    invalidateUserChatCache(userId);
+    invalidateUserCache(userId);
     setCachedChat(userId, chat.chatId, chat);
 
     res.json({
@@ -431,42 +482,18 @@ exports.processChat = async (req, res) => {
       complexity: queryClassification.complexity || 1,
       processingTime
     });
-    await chatSavePromise;
+
+    await saveChatPromise;
   } catch (error) {
     return handleError(res, error, "Error processing chat");
   }
 };
 
-async function generateChatTitle(botResponse, classification, query) {
-  if (classification.isLegal) {
-    const titleMatch = botResponse.match(/\*\*Title:\*\*\s*(.*?)(?:\n|$)/i) ||
-      botResponse.match(/^Title:\s*(.*?)(?:\n|$)/i);
-
-    if (titleMatch && titleMatch[1]) {
-      return titleMatch[1].trim().substring(0, 100);
-    }
-
-    if (classification.specificLaws && classification.specificLaws.length > 0) {
-      return `Query about ${classification.specificLaws[0]}`;
-    }
-
-    return `${classification.subCategory || 'Legal'} Query`;
-  }
-
-  if (query.length <= 50) {
-    return query;
-  }
-
-  return classification.category === "general_chat"
-    ? "General Conversation"
-    : `${classification.category.replace(/_/g, ' ')} Query`;
-}
-
 exports.getAllChats = async (req, res) => {
   try {
     const userId = req.user.userId;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
     const skip = (page - 1) * limit;
 
     const filter = { userId };
@@ -479,97 +506,54 @@ exports.getAllChats = async (req, res) => {
       filter.title = { $regex: req.query.keyword, $options: 'i' };
     }
 
-    const chats = await executeDbOperation(async () => {
-      return await Chat.find(filter)
-        .sort({ updatedAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .select('chatId title chatSummary createdAt updatedAt messages.time')
-        .lean()
-        .maxTimeMS(5000);
-    });
+    const [chats, totalDocs] = await Promise.all([
+      executeDbOperation(() =>
+        Chat.find(filter)
+          .sort({ updatedAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .select('chatId title chatSummary createdAt updatedAt messages.time')
+          .lean()
+          .maxTimeMS(5000)
+      ),
+      executeDbOperation(() => Chat.countDocuments(filter).maxTimeMS(3000))
+    ]);
 
-    const formattedChats = await Promise.all(chats
-      .filter(chat => chat.messages && chat.messages.length > 0)
-      .map(async chat => {
-        const chatItem = {
-          chatId: chat.chatId,
-          title: chat.title,
-          messageCount: chat.messages.length,
-          lastMessageTime: chat.messages.length > 0 ?
-            chat.messages[chat.messages.length - 1].time : null,
-          createdAt: chat.createdAt,
-          updatedAt: chat.updatedAt
-        };
-        if (chat.chatSummary) {
-          try {
-            chatItem.summary = decryptText(chat.chatSummary);
-          } catch (e) {
-            console.error("Failed to decrypt chat summary:", e);
-            chatItem.summary = "Summary unavailable";
-          }
-        } else {
-          chatItem.summary = "";
-        }
-
-        return chatItem;
+    const formattedChats = chats
+      .filter(chat => chat.messages?.length > 0)
+      .map(chat => ({
+        chatId: chat.chatId,
+        title: chat.title,
+        messageCount: chat.messages.length,
+        lastMessageTime: chat.messages[chat.messages.length - 1]?.time,
+        createdAt: chat.createdAt,
+        updatedAt: chat.updatedAt,
+        summary: chat.chatSummary ?
+          (() => {
+            try {
+              return decryptText(chat.chatSummary);
+            } catch {
+              return "Summary unavailable";
+            }
+          })() : ""
       }));
 
-    const cacheBatchSize = 5;
-    setTimeout(async () => {
-      try {
-        const chatIds = formattedChats.slice(0, cacheBatchSize).map(c => c.chatId);
-        const fullChats = await executeDbOperation(async () => {
-          return await Chat.find({
-            userId,
-            chatId: { $in: chatIds }
-          }).maxTimeMS(10000);
-        });
-
-        fullChats.forEach(chat => {
-          setCachedChat(userId, chat.chatId, chat);
-        });
-        if (formattedChats.length > cacheBatchSize) {
-          const remainingChatIds = formattedChats.slice(cacheBatchSize).map(c => c.chatId);
-          setTimeout(async () => {
-            try {
-              const remainingChats = await executeDbOperation(async () => {
-                return await Chat.find({
-                  userId,
-                  chatId: { $in: remainingChatIds }
-                }).maxTimeMS(10000);
-              });
-
-              remainingChats.forEach(chat => {
-                setCachedChat(userId, chat.chatId, chat);
-              });
-            } catch (error) {
-              console.error("Delayed background caching error:", error);
-            }
-          }, 2000);
-        }
-      } catch (error) {
-        console.error("Background caching error:", error);
-      }
-    }, 0);
-
-    const totalDocs = await executeDbOperation(async () => {
-      return await Chat.countDocuments(filter).maxTimeMS(3000);
-    });
+    const chatIds = formattedChats.map(c => c.chatId);
+    setImmediate(() => warmCacheInBackground(userId, chatIds));
 
     res.json({
       chats: formattedChats,
       pagination: {
         page,
         limit,
-        hasMore: chats.length === limit,
         totalPages: Math.ceil(totalDocs / limit),
-        totalChats: totalDocs
+        totalChats: totalDocs,
+        hasMore: chats.length === limit
       },
       cacheStats: chatCache.getStats()
     });
   } catch (error) {
-    return handleError(res, error, "Error fetching all chats");
+    return handleError(res, error, "Error fetching chats");
   }
 };
 
@@ -581,11 +565,11 @@ exports.getChatHistory = async (req, res) => {
     if (!chatId) {
       return res.status(400).json({ message: "Chat ID is required" });
     }
+
     let chat = getCachedChat(userId, chatId);
+
     if (!chat) {
-      chat = await executeDbOperation(async () => {
-        return await Chat.findOne({ userId, chatId });
-      });
+      chat = await executeDbOperation(() => Chat.findOne({ userId, chatId }));
       if (chat) {
         setCachedChat(userId, chatId, chat);
       }
@@ -594,37 +578,23 @@ exports.getChatHistory = async (req, res) => {
     if (!chat) {
       return res.status(404).json({ message: "Chat not found" });
     }
-    const decodedMessages = chat.messages.map(m => {
-      try {
-        return {
-          ...m.toObject ? m.toObject() : m,
-          text: decryptText(m.text)
-        };
-      } catch (e) {
-        console.error(`Error decrypting message: ${e.message}`);
-        return {
-          ...m.toObject ? m.toObject() : m,
-          text: "Message couldn't be decrypted",
-          decryptionError: process.env.NODE_ENV === 'development' ? e.message : 'Decryption failed'
-        };
-      }
-    });
 
-    let decodedSummary = "";
+    const messages = batchDecryptMessages(chat.messages);
+
+    let summary = "";
     if (chat.chatSummary) {
       try {
-        decodedSummary = decryptText(chat.chatSummary);
-      } catch (e) {
-        console.error("Error decrypting chat summary:", e);
-        decodedSummary = "Summary unavailable";
+        summary = decryptText(chat.chatSummary);
+      } catch {
+        summary = "Summary unavailable";
       }
     }
 
     res.json({
       chatId: chat.chatId,
       title: chat.title,
-      messages: decodedMessages,
-      chatSummary: decodedSummary,
+      messages,
+      chatSummary: summary,
       createdAt: chat.createdAt,
       updatedAt: chat.updatedAt
     });
@@ -641,22 +611,24 @@ exports.clearChatHistory = async (req, res) => {
     if (!chatId) {
       return res.status(400).json({ message: "Chat ID is required" });
     }
-    const chat = await executeDbOperation(async () => {
-      return await Chat.findOneAndUpdate(
+
+    const chat = await executeDbOperation(() =>
+      Chat.findOneAndUpdate(
         { userId, chatId },
         { $set: { messages: [], chatSummary: "" } },
         { new: true }
-      );
-    });
+      )
+    );
 
     if (!chat) {
       return res.status(404).json({ message: "Chat not found" });
     }
 
-    res.json({ message: "Chat history cleared" });
+    chatCache.delete(getCacheKey(userId, chatId));
+
+    res.json({ message: "Chat history cleared successfully" });
   } catch (error) {
-    console.error("❌ Error clearing chat history:", error);
-    res.status(500).json({ message: "Error clearing chat history" });
+    return handleError(res, error, "Error clearing chat history");
   }
 };
 
@@ -666,17 +638,16 @@ exports.cleanupEmptyChats = async (req, res) => {
       return res.status(403).json({ message: "Unauthorized" });
     }
 
-    const result = await executeDbOperation(async () => {
-      return await Chat.deleteMany({ "messages": { $size: 0 } });
-    });
+    const result = await executeDbOperation(() =>
+      Chat.deleteMany({ messages: { $size: 0 } })
+    );
 
     res.json({
       message: "Cleanup completed",
       deletedCount: result.deletedCount
     });
   } catch (error) {
-    console.error("❌ Error during manual chat cleanup:", error);
-    res.status(500).json({ message: "Error during cleanup" });
+    return handleError(res, error, "Error during cleanup");
   }
 };
 
@@ -693,9 +664,7 @@ exports.createNewChat = async (req, res) => {
     });
 
     await lockManager.withLock(newChat._id.toString(), async () => {
-      await executeDbOperation(async () => {
-        await newChat.save();
-      });
+      await executeDbOperation(() => newChat.save());
     });
 
     res.json({
@@ -705,8 +674,7 @@ exports.createNewChat = async (req, res) => {
       chatSummary: ""
     });
   } catch (error) {
-    console.error("❌ Error creating new chat:", error);
-    res.status(500).json({ message: "Error creating new chat" });
+    return handleError(res, error, "Error creating chat");
   }
 };
 
@@ -720,18 +688,19 @@ exports.updateChatTitle = async (req, res) => {
       return res.status(400).json({ message: "Chat ID is required" });
     }
 
-    if (!title || title.trim() === '') {
+    if (!title?.trim()) {
       return res.status(400).json({ message: "Title is required and cannot be empty" });
     }
 
     const sanitizedTitle = title.trim().substring(0, 100);
-    const chat = await executeDbOperation(async () => {
-      return await Chat.findOneAndUpdate(
+
+    const chat = await executeDbOperation(() =>
+      Chat.findOneAndUpdate(
         { userId, chatId },
         { title: sanitizedTitle },
         { new: true }
-      );
-    });
+      )
+    );
 
     if (!chat) {
       return res.status(404).json({ message: "Chat not found" });
@@ -756,15 +725,15 @@ exports.deleteChat = async (req, res) => {
       return res.status(400).json({ message: "Chat ID is required" });
     }
 
-    const result = await executeDbOperation(async () => {
-      return await Chat.findOneAndDelete({ userId, chatId });
-    });
+    const result = await executeDbOperation(() =>
+      Chat.findOneAndDelete({ userId, chatId })
+    );
 
     if (!result) {
       return res.status(404).json({ message: "Chat not found" });
     }
-    const key = `${userId}:${chatId}`;
-    chatCache.delete(key);
+
+    chatCache.delete(getCacheKey(userId, chatId));
 
     res.json({ message: "Chat deleted successfully", chatId });
   } catch (error) {
@@ -778,21 +747,24 @@ exports.getServiceStatus = async (req, res) => {
   }
 
   try {
-    const metrics = getServiceMetrics();
-    const dbStatus = dbConnection.getConnectionStatus();
+    const [metrics, dbStatus, dbStats] = await Promise.all([
+      Promise.resolve(getServiceMetrics()),
+      Promise.resolve(dbConnection.getConnectionStatus()),
+      executeDbOperation(async () => {
+        const [chatCount, avgSize, recentActivity] = await Promise.all([
+          Chat.countDocuments(),
+          Chat.aggregate([
+            { $project: { messageCount: { $size: "$messages" } } },
+            { $group: { _id: null, avg: { $avg: "$messageCount" } } }
+          ]).then(result => result[0]?.avg || 0),
+          Chat.countDocuments({
+            updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+          })
+        ]);
 
-    const dbStats = await executeDbOperation(async () => {
-      return {
-        chatCount: await Chat.countDocuments(),
-        avgChatSize: await Chat.aggregate([
-          { $project: { messageCount: { $size: "$messages" } } },
-          { $group: { _id: null, avg: { $avg: "$messageCount" } } }
-        ]).then(result => result[0]?.avg || 0),
-        recentActivity: await Chat.countDocuments({
-          updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
-        })
-      };
-    });
+        return { chatCount, avgChatSize: avgSize, recentActivity };
+      })
+    ]);
 
     const systemLoad = {
       cpuUsage: process.cpuUsage(),
