@@ -21,7 +21,6 @@ class LRUCache {
       maxSize: options.maxSize || 100,
       ttlMs: options.ttlMs || 15 * 60 * 1000,
       maxMemoryMB: options.maxMemoryMB || 100,
-      cleanupIntervalMs: options.cleanupIntervalMs || 60 * 1000
     };
 
     this.metrics = {
@@ -31,13 +30,10 @@ class LRUCache {
       estimatedMemoryBytes: 0
     };
 
-    this.lastCleanup = Date.now();
   }
 
   get(key) {
     const now = Date.now();
-    this._maybeCleanup(now);
-
     const item = this.cache.get(key);
 
     if (!item) {
@@ -60,8 +56,6 @@ class LRUCache {
 
   set(key, value) {
     const now = Date.now();
-    this._maybeCleanup(now);
-
     const itemSize = this._estimateSize(value);
 
     while (
@@ -155,33 +149,6 @@ class LRUCache {
     if (oldestKey) {
       this._removeItem(oldestKey);
       this.metrics.evictions++;
-    }
-  }
-
-  _maybeCleanup(now) {
-    if (now - this.lastCleanup < this.config.cleanupIntervalMs) {
-      return;
-    }
-
-    let removedCount = 0;
-    let freedBytes = 0;
-
-    for (const [key, item] of this.cache.entries()) {
-      if (item.expiry < now) {
-        freedBytes += item.size;
-        this.cache.delete(key);
-        removedCount++;
-      }
-    }
-
-    this.metrics.estimatedMemoryBytes -= freedBytes;
-    this.metrics.evictions += removedCount;
-    this.lastCleanup = now;
-
-    if (removedCount > 0) {
-      console.log(
-        `Cache cleanup: removed ${removedCount} items, freed ${(freedBytes / (1024 * 1024)).toFixed(2)} MB`
-      );
     }
   }
 
@@ -633,50 +600,13 @@ exports.clearChatHistory = async (req, res) => {
   }
 };
 
-exports.cleanupEmptyChats = async (req, res) => {
-  try {
-    if (!req.user.isAdmin) {
-      return res.status(403).json({ message: "Unauthorized" });
-    }
-
-    const result = await executeDbOperation(() =>
-      Chat.deleteMany({ messages: { $size: 0 } })
-    );
-
-    res.json({
-      message: "Cleanup completed",
-      deletedCount: result.deletedCount
-    });
-  } catch (error) {
-    return handleError(res, error, "Error during cleanup");
-  }
-};
-
 exports.createNewChat = async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const chatId = uuidv4();
-
-    const newChat = new Chat({
-      userId,
-      chatId,
-      title: "New Chat",
-      messages: []
-    });
-
-    await lockManager.withLock(newChat._id.toString(), async () => {
-      await executeDbOperation(() => newChat.save());
-    });
-
-    res.json({
-      chatId: newChat.chatId,
-      title: newChat.title,
-      messages: [],
-      chatSummary: ""
-    });
-  } catch (error) {
-    return handleError(res, error, "Error creating chat");
-  }
+  res.json({
+    chatId: null,
+    title: "New Chat",
+    messages: [],
+    chatSummary: ""
+  });
 };
 
 exports.updateChatTitle = async (req, res) => {

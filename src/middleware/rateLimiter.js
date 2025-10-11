@@ -2,7 +2,6 @@ class RateLimiter {
     constructor() {
         this.requests = new Map();
         this.ipLimits = new Map();
-        setInterval(() => this._cleanup(), 60000);
         this.defaultLimits = {
             windowMs: 60 * 1000,
             maxRequests: 60,
@@ -12,21 +11,6 @@ class RateLimiter {
     _getClientIp(req) {
         return req.headers['x-forwarded-for']?.split(',')[0].trim() ||
             req.socket.remoteAddress;
-    }
-
-    _cleanup() {
-        const now = Date.now();
-        const windowMs = this.defaultLimits.windowMs;
-
-        for (const [ip, requests] of this.requests.entries()) {
-            const validRequests = requests.filter(timestamp => now - timestamp < windowMs);
-
-            if (validRequests.length === 0) {
-                this.requests.delete(ip);
-            } else {
-                this.requests.set(ip, validRequests);
-            }
-        }
     }
 
     setLimit(ip, maxRequests, windowMs = this.defaultLimits.windowMs) {

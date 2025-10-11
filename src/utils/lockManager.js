@@ -3,7 +3,6 @@ class LockManager {
         this.locks = new Map();
         this.waitingQueue = new Map();
         this.lockTimeout = 30000;
-        this.cleanupInterval = setInterval(() => this._cleanupStaleLocks(), 10000);
         this.metrics = {
             acquiredCount: 0,
             contentionCount: 0,
@@ -47,15 +46,11 @@ class LockManager {
                 this.waitingQueue.get(documentId).push(waitInfo);
             });
 
-            try {
-                await waitPromise;
-                const waitTime = Date.now() - startTime;
-                this.metrics.totalWaitTime += waitTime;
-                this.metrics.waitCount++;
-                this.metrics.avgWaitTime = this.metrics.totalWaitTime / this.metrics.waitCount;
-            } catch (err) {
-                throw err;
-            }
+            await waitPromise;
+            const waitTime = Date.now() - startTime;
+            this.metrics.totalWaitTime += waitTime;
+            this.metrics.waitCount++;
+            this.metrics.avgWaitTime = this.metrics.totalWaitTime / this.metrics.waitCount;
         }
 
         this.locks.set(documentId, {
@@ -101,23 +96,6 @@ class LockManager {
             if (lockOwner) {
                 this.releaseLock(documentId, lockOwner);
             }
-        }
-    }
-
-    _cleanupStaleLocks() {
-        const now = Date.now();
-        let cleanedCount = 0;
-
-        for (const [docId, lockInfo] of this.locks.entries()) {
-            if (now - lockInfo.timestamp > this.lockTimeout) {
-                console.warn(`Cleaning up stale lock for document ${docId} after ${(now - lockInfo.timestamp) / 1000}s`);
-                this.releaseLock(docId);
-                cleanedCount++;
-            }
-        }
-
-        if (cleanedCount > 0) {
-            console.log(`Cleaned up ${cleanedCount} stale locks`);
         }
     }
 

@@ -63,9 +63,6 @@ app.use((err, req, res, next) => {
 function startServer() {
   const server = app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT} in ${NODE_ENV} mode`);
-
-    const { startCleanupInterval } = require("./services/cleanupService");
-    global.cleanupInterval = startCleanupInterval(60);
   });
 
   server.timeout = TIMEOUT;
@@ -89,7 +86,6 @@ function startServer() {
     console.log("Shutting down server...");
     server.close(() => {
       console.log("Server closed gracefully");
-      if (global.cleanupInterval) clearInterval(global.cleanupInterval);
       process.exit(0);
     });
 

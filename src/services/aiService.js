@@ -6,7 +6,6 @@ const CONFIG = {
   CACHE: {
     MAX_SIZE: 1000,
     TTL: 24 * 60 * 60 * 1000,
-    CLEANUP_INTERVAL: 60 * 60 * 1000
   },
   REQUEST: {
     MAX_RETRIES: 3,
@@ -171,7 +170,6 @@ class AdvancedCache {
     };
     this.accessOrder = [];
     this.priorityKeys = new Set();
-    this._scheduleCleanup();
   }
 
   set(key, value, isPriority = false) {
@@ -257,19 +255,6 @@ class AdvancedCache {
     this.cache.delete(key);
     this.priorityKeys.delete(key);
     this.stats.evictions++;
-  }
-
-  _scheduleCleanup() {
-    setInterval(() => this._cleanup(), CONFIG.CACHE.CLEANUP_INTERVAL);
-  }
-
-  _cleanup() {
-    const now = Date.now();
-    for (const [key, entry] of this.cache.entries()) {
-      if (now - entry.timestamp > this.ttl) {
-        this._remove(key);
-      }
-    }
   }
 
   getStats() {

@@ -10,6 +10,5 @@ router.get("/history/:chatId", authenticateToken, chatController.getChatHistory)
 router.delete("/history/:chatId", authenticateToken, chatController.clearChatHistory);
 router.post("/new", authenticateToken, chatController.createNewChat);
 router.patch("/title/:chatId", authenticateToken, chatController.updateChatTitle);
-router.post("/cleanup", authenticateToken, chatController.cleanupEmptyChats);
 
 module.exports = router;
