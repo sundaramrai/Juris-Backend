@@ -2,8 +2,6 @@ const mongoose = require('mongoose');
 
 class DatabaseManager {
     constructor() {
-        this.isConnected = false;
-        this.connectionAttempts = 0;
         this.maxRetries = 5;
         this.retryInterval = 5000;
         this.connectionOptions = {
@@ -15,7 +13,6 @@ class DatabaseManager {
             keepAlive: true,
             keepAliveInitialDelay: 300000
         };
-
         this.metrics = {
             connectionsOpened: 0,
             connectionsClosed: 0,
@@ -25,76 +22,61 @@ class DatabaseManager {
             lastDisconnectedTime: null,
             currentStatus: 'disconnected'
         };
-
-        mongoose.connection.on('connected', () => this._handleConnected());
-        mongoose.connection.on('disconnected', () => this._handleDisconnected());
-        mongoose.connection.on('error', (err) => this._handleError(err));
+        this._shuttingDown = false;
+        this._setupListeners();
     }
 
-    _handleConnected() {
-        this.isConnected = true;
-        this.metrics.connectionsOpened++;
-        this.metrics.lastConnectedTime = new Date();
-        this.metrics.currentStatus = 'connected';
-        this.connectionAttempts = 0;
-        console.log('Successfully connected to MongoDB');
-    }
-
-    _handleDisconnected() {
-        this.isConnected = false;
-        this.metrics.connectionsClosed++;
-        this.metrics.lastDisconnectedTime = new Date();
-        this.metrics.currentStatus = 'disconnected';
-        console.log('MongoDB disconnected');
-
-        if (!this._shuttingDown) {
-            this._reconnect();
-        }
-    }
-
-    _handleError(err) {
-        this.metrics.connectionsErrored++;
-        console.error('MongoDB connection error:', err);
-
-        if (this.isConnected) {
-            this.isConnected = false;
+    _setupListeners() {
+        mongoose.connection.on('connected', () => {
+            this.metrics.connectionsOpened++;
+            this.metrics.lastConnectedTime = new Date();
+            this.metrics.currentStatus = 'connected';
+            console.log('Successfully connected to MongoDB');
+        });
+        mongoose.connection.on('disconnected', () => {
+            this.metrics.connectionsClosed++;
+            this.metrics.lastDisconnectedTime = new Date();
+            this.metrics.currentStatus = 'disconnected';
+            console.log('MongoDB disconnected');
+            if (!this._shuttingDown) this._reconnect();
+        });
+        mongoose.connection.on('error', (err) => {
+            this.metrics.connectionsErrored++;
             this.metrics.currentStatus = 'errored';
-        }
+            console.error('MongoDB connection error:', err);
+        });
     }
 
-    async _reconnect() {
-        if (this.connectionAttempts >= this.maxRetries) {
+    async _reconnect(attempt = 1) {
+        if (attempt > this.maxRetries) {
             console.error(`Failed to reconnect to MongoDB after ${this.maxRetries} attempts`);
             return;
         }
-
-        this.connectionAttempts++;
         this.metrics.lastReconnectAttempt = new Date();
         this.metrics.currentStatus = 'reconnecting';
-        console.log(`Attempting to reconnect to MongoDB (${this.connectionAttempts}/${this.maxRetries})`);
-
-        try {
-            await this.connect(this.connectionString);
-        } catch (err) {
-            console.error('Reconnection attempt failed:', err);
-            setTimeout(() => this._reconnect(), this.retryInterval);
-        }
+        console.log(`Attempting to reconnect to MongoDB (${attempt}/${this.maxRetries})`);
+        setTimeout(async () => {
+            try {
+                await this.connect(this.connectionString, attempt);
+            } catch {
+                this._reconnect(attempt + 1);
+            }
+        }, this.retryInterval);
     }
 
-    async connect(connectionString) {
-        if (!connectionString) {
-            throw new Error('MongoDB connection string is required');
-        }
-
+    async connect(connectionString, attempt = 1) {
+        if (!connectionString) throw new Error('MongoDB connection string is required');
         this.connectionString = connectionString;
-
+        if (mongoose.connection.readyState === 1) return mongoose.connection;
         try {
-            if (!this.isConnected) {
-                await mongoose.connect(connectionString, this.connectionOptions);
-                this.isConnected = true;
-            }
+            await mongoose.connect(connectionString, this.connectionOptions);
             return mongoose.connection;
         } catch (err) {
+            if (attempt < this.maxRetries) {
+                console.error('Failed to connect to MongoDB, retrying...', err);
+                await new Promise(res => setTimeout(res, this.retryInterval));
+                return this.connect(connectionString, attempt + 1);
+            }
             console.error('Failed to connect to MongoDB:', err);
             throw err;
         }
@@ -102,10 +84,9 @@ class DatabaseManager {
 
     async disconnect() {
         this._shuttingDown = true;
-        if (this.isConnected) {
+        if (mongoose.connection.readyState !== 0) {
             try {
                 await mongoose.disconnect();
-                this.isConnected = false;
                 console.log('Disconnected from MongoDB');
             } catch (err) {
                 console.error('Error disconnecting from MongoDB:', err);
@@ -120,11 +101,9 @@ class DatabaseManager {
 
     getConnectionStatus() {
         return {
-            isConnected: this.isConnected,
+            isConnected: mongoose.connection.readyState === 1,
             ...this.metrics,
-            connectionStats: mongoose.connection.db ?
-                mongoose.connection.db.serverConfig.s.coreTopology.s.state :
-                'unavailable'
+            connectionState: mongoose.STATES[mongoose.connection.readyState] || 'unknown'
         };
     }
 }
