@@ -1,3 +1,4 @@
+// src/config/dbConnection.js
 const mongoose = require('mongoose');
 const EventEmitter = require('events');
 

@@ -1,3 +1,4 @@
+// src/controllers/chatController.js
 const mongoose = require('mongoose');
 const Chat = require("../models/Chat");
 const { v4: uuidv4 } = require("uuid");
