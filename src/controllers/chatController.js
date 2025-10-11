@@ -266,40 +266,52 @@ const batchDecryptMessages = (messages) => {
   return results;
 };
 
+const ensureDbConnected = async () => {
+  if (mongoose.connection.readyState !== 1) {
+    console.warn(`MongoDB not connected (state: ${mongoose.connection.readyState}). Attempting to reconnect...`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    if (mongoose.connection.readyState !== 1) {
+      try {
+        await dbConnection.connect();
+      } catch (connError) {
+        console.error("Reconnection attempt failed:", connError.message);
+      }
+    }
+  }
+};
+
+const isConnectionError = (error) => {
+  return (
+    error.name === 'MongoNetworkError' ||
+    error.name === 'MongoTimeoutError' ||
+    (typeof error.message === 'string' && (
+      error.message.includes('topology') ||
+      error.message.includes('connection')
+    )) ||
+    error.name === 'MongoServerSelectionError'
+  );
+};
+
+const handleRetry = async (retries) => {
+  await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+  try {
+    await dbConnection.connect();
+  } catch (connError) {
+    console.error("Reconnection attempt failed:", connError.message);
+  }
+};
+
 const executeDbOperation = async (operation, maxRetries = 3) => {
   let retries = 0;
   while (retries < maxRetries) {
     try {
-      if (mongoose.connection.readyState !== 1) {
-        console.warn(`MongoDB not connected (state: ${mongoose.connection.readyState}). Attempting to reconnect...`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        if (mongoose.connection.readyState !== 1) {
-          try {
-            await dbConnection.connect();
-          } catch (connError) {
-            console.error("Reconnection attempt failed:", connError.message);
-          }
-        }
-      }
-
+      await ensureDbConnected();
       return await operation();
     } catch (error) {
       retries++;
-      const isConnectionError =
-        error.name === 'MongoNetworkError' ||
-        error.name === 'MongoTimeoutError' ||
-        error.message.includes('topology') ||
-        error.message.includes('connection') ||
-        error.name === 'MongoServerSelectionError';
-
-      if (isConnectionError && retries < maxRetries) {
+      if (isConnectionError(error) && retries < maxRetries) {
         console.warn(`MongoDB operation failed due to connection issue. Retrying (${retries}/${maxRetries})...`);
-        await new Promise(resolve => setTimeout(resolve, 1000 * retries));
-        try {
-          await dbConnection.connect();
-        } catch (connError) {
-          console.error("Reconnection attempt failed:", connError.message);
-        }
+        await handleRetry(retries);
       } else {
         throw error;
       }
