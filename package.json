@@ -26,22 +26,23 @@
   "description": "",
   "dependencies": {
     "@google/generative-ai": "^0.22.0",
+    "axios": "^1.6.2",
     "bcrypt": "^5.1.1",
     "bson": "^6.10.3",
+    "cheerio": "^1.0.0-rc.12",
     "compression": "^1.8.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "helmet": "^8.1.0",
+    "jsdom": "^22.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.10.0",
+    "morgan": "^1.10.1",
+    "node-cache": "^5.1.2",
     "nodemailer": "^6.10.0",
     "nodemon": "^3.1.9",
-    "uuid": "^11.1.0",
-    "axios": "^1.6.2",
-    "cheerio": "^1.0.0-rc.12",
-    "jsdom": "^22.1.0",
-    "node-cache": "^5.1.2"
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
     "@types/bcrypt": "^5.0.2",
