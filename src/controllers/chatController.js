@@ -1,10 +1,8 @@
-// src/controllers/chatController.js
 const mongoose = require('mongoose');
 const Chat = require("../models/Chat");
 const { v4: uuidv4 } = require("uuid");
 const { encryptText, decryptText } = require("../utils/encryption");
 const {
-  generateGeminiResponse,
   generateChatSummary,
   processQuery,
   getServiceMetrics,
@@ -206,9 +204,10 @@ const setCachedChat = (userId, chatId, data) => {
 
 const invalidateUserCache = (userId) => {
   const prefix = `${userId}:`;
-  chatCache.keys()
-    .filter(key => key.startsWith(prefix))
-    .forEach(key => chatCache.delete(key));
+  const keysToDelete = chatCache.keys().filter(key => key.startsWith(prefix));
+  for (const key of keysToDelete) {
+    chatCache.delete(key);
+  }
 };
 
 const batchDecryptMessages = (messages) => {
@@ -307,7 +306,7 @@ const generateChatTitle = (botResponse, classification, query) => {
 
   return classification.category === 'general_chat'
     ? 'General Conversation'
-    : `${classification.category.replace(/_/g, ' ')} Query`;
+    : `${classification.category.replaceAll('_', ' ')} Query`;
 };
 
 const warmCacheInBackground = (userId, chatIds) => {
@@ -320,7 +319,7 @@ const warmCacheInBackground = (userId, chatIds) => {
     batches.push(chatIds.slice(i, i + BATCH_SIZE));
   }
 
-  batches.forEach((batch, index) => {
+  for (const [index, batch] of batches.entries()) {
     setTimeout(async () => {
       try {
         const chats = await executeDbOperation(async () => {
@@ -330,12 +329,16 @@ const warmCacheInBackground = (userId, chatIds) => {
           }).maxTimeMS(10000);
         });
 
-        chats.forEach(chat => setCachedChat(userId, chat.chatId, chat));
+        if (Array.isArray(chats)) {
+          for (const chat of chats) {
+            setCachedChat(userId, chat.chatId, chat);
+          }
+        }
       } catch (error) {
         console.error('Cache warming error:', error.message);
       }
     }, index * 2000);
-  });
+  }
 };
 
 exports.processChat = async (req, res) => {
@@ -460,8 +463,8 @@ exports.processChat = async (req, res) => {
 exports.getAllChats = async (req, res) => {
   try {
     const userId = req.user.userId;
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const page = Math.max(1, Number.parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit) || 20));
     const skip = (page - 1) * limit;
 
     const filter = { userId };
@@ -493,7 +496,7 @@ exports.getAllChats = async (req, res) => {
         chatId: chat.chatId,
         title: chat.title,
         messageCount: chat.messages.length,
-        lastMessageTime: chat.messages[chat.messages.length - 1]?.time,
+        lastMessageTime: chat.messages.at(-1)?.time,
         createdAt: chat.createdAt,
         updatedAt: chat.updatedAt,
         summary: chat.chatSummary ?
@@ -701,7 +704,7 @@ exports.getServiceStatus = async (req, res) => {
       cpuUsage: process.cpuUsage(),
       memoryUsage: process.memoryUsage(),
       uptime: process.uptime(),
-      loadAverage: process.platform === 'win32' ? [0, 0, 0] : require('os').loadavg()
+      loadAverage: process.platform === 'win32' ? [0, 0, 0] : require('node:os').loadavg()
     };
 
     res.json({

@@ -1,6 +1,3 @@
-/**
- * Global error handling middleware
- */
 class ErrorHandler {
     constructor() {
         this.errorLog = [];

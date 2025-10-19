@@ -1,6 +1,6 @@
 // src/config/dbConnection.js
 const mongoose = require('mongoose');
-const EventEmitter = require('events');
+const EventEmitter = require('node:events');
 
 const ConnectionState = {
     DISCONNECTED: 0,

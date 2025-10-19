@@ -1,5 +1,4 @@
-// src/utils/encryption.js
-const crypto = require("crypto");
+const crypto = require("node:crypto");
 
 const algorithm = "aes-256-gcm";
 const IV_LENGTH = 16;

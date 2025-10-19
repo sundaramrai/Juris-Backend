@@ -30,7 +30,7 @@ class LockManager {
                     timeout: setTimeout(() => {
                         const queue = this.waitingQueue.get(documentId);
                         if (queue) {
-                            const index = queue.findIndex(w => w === waitInfo);
+                            const index = queue.indexOf(waitInfo);
                             if (index !== -1) {
                                 queue.splice(index, 1);
                                 if (queue.length === 0) {

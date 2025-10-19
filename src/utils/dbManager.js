@@ -1,28 +1,29 @@
 const mongoose = require('mongoose');
 
 class DatabaseManager {
+    maxRetries = 5;
+    retryInterval = 5000;
+    connectionOptions = {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+        serverSelectionTimeoutMS: 5000,
+        poolSize: 10,
+        socketTimeoutMS: 45000,
+        keepAlive: true,
+        keepAliveInitialDelay: 300000
+    };
+    metrics = {
+        connectionsOpened: 0,
+        connectionsClosed: 0,
+        connectionsErrored: 0,
+        lastReconnectAttempt: null,
+        lastConnectedTime: null,
+        lastDisconnectedTime: null,
+        currentStatus: 'disconnected'
+    };
+    _shuttingDown = false;
+
     constructor() {
-        this.maxRetries = 5;
-        this.retryInterval = 5000;
-        this.connectionOptions = {
-            useNewUrlParser: true,
-            useUnifiedTopology: true,
-            serverSelectionTimeoutMS: 5000,
-            poolSize: 10,
-            socketTimeoutMS: 45000,
-            keepAlive: true,
-            keepAliveInitialDelay: 300000
-        };
-        this.metrics = {
-            connectionsOpened: 0,
-            connectionsClosed: 0,
-            connectionsErrored: 0,
-            lastReconnectAttempt: null,
-            lastConnectedTime: null,
-            lastDisconnectedTime: null,
-            currentStatus: 'disconnected'
-        };
-        this._shuttingDown = false;
         this._setupListeners();
     }
 

@@ -1,10 +1,9 @@
-// src/controllers/authController.js
 const User = require("../models/User");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { encryptText, decryptText, hashUsername } = require("../utils/encryption");
 const { transporter } = require("../config/email");
-const crypto = require("crypto");
+const crypto = require("node:crypto");
 
 const otpStorage = new Map();
 

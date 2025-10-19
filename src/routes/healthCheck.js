@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const os = require('os');
+const os = require('node:os');
 const { errorHandler } = require('../middleware/errorHandler');
 const lockManager = require('../utils/lockManager');
 const dbManager = require('../utils/dbManager');
@@ -77,8 +77,8 @@ router.get('/errors', (req, res) => {
         const isDev = process.env.NODE_ENV !== 'production';
         if (!isDev && !isAdmin) return res.status(403).json({ error: 'Unauthorized access' });
 
-        const limit = parseInt(req.query.limit) || 50;
-        if (isNaN(limit) || limit <= 0) return res.status(400).json({ error: 'Invalid limit parameter' });
+        const limit = Number.parseInt(req.query.limit) || 50;
+        if (Number.isNaN(limit) || limit <= 0) return res.status(400).json({ error: 'Invalid limit parameter' });
 
         const errors = errorHandler.getRecentErrors(limit);
         res.status(200).json({ count: errors.length, errors });

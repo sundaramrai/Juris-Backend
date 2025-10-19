@@ -1,6 +1,6 @@
 // src/services/aiService.js
 const { model } = require("../config/ai");
-require('events').EventEmitter.defaultMaxListeners = 20;
+require('node:events').EventEmitter.defaultMaxListeners = 20;
 
 const CONFIG = {
   CACHE: {
@@ -376,7 +376,10 @@ const Utils = {
   },
 
   simplifyLegalTerms: (text) => {
-    const pattern = new RegExp('\\b(' + Object.keys(LEGAL_TERMS).join('|') + ')\\b', 'gi');
+    const termsPattern = Object.keys(LEGAL_TERMS)
+      .map(k => k.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\\$&`))
+      .join('|');
+    const pattern = new RegExp(String.raw`\b(${termsPattern})\b`, 'gi');
     return text.replace(pattern, (match) => {
       const term = LEGAL_TERMS[match.toLowerCase()];
       return `${match} (${term})`;
@@ -486,7 +489,7 @@ Format:
         result.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
         result.text?.();
 
-      text = text.trim().replace(/```json\n?|\n?```/g, '');
+      text = text.trim().replaceAll(/```json\n?|\n?```/g, '');
 
       if (text.startsWith('{') && text.endsWith('}')) {
         const classification = JSON.parse(text);
@@ -715,20 +718,20 @@ async function processQuery(query) {
       }
       return {
         response: "Our AI service is temporarily unavailable. Please try again shortly.",
-        classification: { isLegal: false, category: "service_unavailable", confidence: 1.0 }
+        classification: { isLegal: false, category: "service_unavailable", confidence: 1 }
       };
     }
 
     const classification = await Classifier.withAI(query);
 
     let response;
-    if (classification.category === "general_chat") {
+    if (classification.isLegal) {
+      response = await ResponseGenerator.legal(query, classification);
+    } else if (classification.category === "general_chat") {
       response = ResponseGenerator.chat(query);
-    } else if (!classification.isLegal) {
+    } else {
       const handler = ResponseGenerator[classification.category];
       response = handler ? handler(query) : ResponseGenerator.chat(query);
-    } else {
-      response = await ResponseGenerator.legal(query, classification);
     }
 
     if (health.connection.consecutiveErrors > 0) {
@@ -764,7 +767,7 @@ async function generateChatSummary(messages) {
       isLegal: false,
       category: "general_chat"
     });
-    summary = summary.trim().replace(/[^a-zA-Z0-9\s]/g, "").replace(/\s+/g, " ");
+    summary = summary.trim().replaceAll(/[^a-zA-Z0-9\s]/g, "").replaceAll(/\s+/g, " ");
     const words = summary.split(" ").filter(w => w.length > 0).slice(0, 6);
     return words.join(" ");
   } catch (error) {
@@ -910,7 +913,7 @@ module.exports = {
   getServiceMetrics,
   getUnavailableServiceResponse: () => ({
     response: "Our AI service is temporarily unavailable. We're working to restore service. Please try again later.",
-    classification: { isLegal: false, category: "service_unavailable", confidence: 1.0 }
+    classification: { isLegal: false, category: "service_unavailable", confidence: 1 }
   }),
   withRetry: RetryHandler.execute,
   prioritizeQuery: determinePriority,
