@@ -375,6 +375,7 @@ exports.processChat = async (req, res) => {
     let chat;
     let messageCount = 0;
     let plainMessages = [];
+    let isNewChat = false;
 
     if (chatId) {
       chat = getCachedChat(userId, chatId) ||
@@ -391,8 +392,9 @@ exports.processChat = async (req, res) => {
         { type: "bot", text: encryptText(botResponse), time: timestamp, metadata: botMessage.metadata }
       );
     } else {
-      const newChatId = chatId || uuidv4();
+      const newChatId = uuidv4();
       plainMessages = [userMessage, botMessage];
+      isNewChat = true;
 
       chat = new Chat({
         userId,
@@ -416,25 +418,31 @@ exports.processChat = async (req, res) => {
       }
     }
 
-    const saveChatPromise = lockManager.withLock(chat._id.toString(), async () => {
-      try {
-        await executeDbOperation(async () => {
-          const freshChat = await Chat.findById(chat._id);
-          if (freshChat) {
-            Object.assign(freshChat, {
-              messages: chat.messages,
-              lastActivity: chat.lastActivity,
-              chatSummary: chat.chatSummary,
-              title: chat.title
-            });
-            await freshChat.save();
-          }
-        });
-      } catch (error) {
-        console.error('Error saving with lock:', error.message);
-        await executeDbOperation(() => chat.save());
-      }
-    });
+    if (isNewChat) {
+      await executeDbOperation(() => chat.save());
+    } else {
+      const saveChatPromise = lockManager.withLock(chat._id.toString(), async () => {
+        try {
+          await executeDbOperation(async () => {
+            const freshChat = await Chat.findById(chat._id);
+            if (freshChat) {
+              Object.assign(freshChat, {
+                messages: chat.messages,
+                lastActivity: chat.lastActivity,
+                chatSummary: chat.chatSummary,
+                title: chat.title
+              });
+              await freshChat.save();
+            }
+          });
+        } catch (error) {
+          console.error('Error saving with lock:', error.message);
+          await executeDbOperation(() => chat.save());
+        }
+      });
+
+      setImmediate(() => saveChatPromise);
+    }
 
     invalidateUserCache(userId);
     setCachedChat(userId, chat.chatId, chat);
@@ -449,10 +457,9 @@ exports.processChat = async (req, res) => {
       isLegal: queryClassification.isLegal,
       messageCount: messageCount + 2,
       complexity: queryClassification.complexity || 1,
-      processingTime
+      processingTime,
+      isNewChat
     });
-
-    await saveChatPromise;
   } catch (error) {
     return handleError(res, error, "Error processing chat");
   }
