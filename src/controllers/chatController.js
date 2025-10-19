@@ -244,19 +244,23 @@ const isConnectionError = (error) => {
 };
 
 const ensureDbConnection = async () => {
-  if (mongoose.connection.readyState === 1) return;
+  const currentState = mongoose.connection.readyState;
 
-  console.warn(`MongoDB not connected (state: ${mongoose.connection.readyState}). Reconnecting...`);
+  if (currentState === 1) return;
 
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  if (currentState === 2) {
+    console.log('MongoDB connection in progress, waiting...');
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    if (mongoose.connection.readyState === 1) return;
+  }
 
-  if (mongoose.connection.readyState !== 1) {
-    try {
-      await dbConnection.connect();
-    } catch (error) {
-      console.error('Reconnection failed:', error.message);
-      throw error;
-    }
+  console.warn(`MongoDB not ready (state: ${currentState}). Attempting reconnection...`);
+
+  try {
+    await dbConnection.connect();
+  } catch (error) {
+    console.error('Reconnection failed:', error.message);
+    throw error;
   }
 };
 
@@ -269,14 +273,8 @@ const executeDbOperation = async (operation, maxRetries = 3) => {
       const isLastAttempt = attempt === maxRetries;
 
       if (isConnectionError(error) && !isLastAttempt) {
-        console.warn(`DB operation failed. Retry ${attempt}/${maxRetries}...`);
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-
-        try {
-          await dbConnection.connect();
-        } catch (connError) {
-          console.error('Reconnection attempt failed:', connError.message);
-        }
+        console.warn(`DB operation failed (attempt ${attempt}/${maxRetries}):`, error.message);
+        await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
       } else {
         throw error;
       }
