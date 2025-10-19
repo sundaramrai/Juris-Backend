@@ -1,4 +1,3 @@
-// src/config/dbConnection.js
 const mongoose = require('mongoose');
 const EventEmitter = require('node:events');
 
@@ -35,6 +34,8 @@ class MongoConnectionManager extends EventEmitter {
         this.config = { ...DEFAULT_OPTIONS, ...options };
         this.reconnectAttempts = 0;
         this.isConnected = false;
+        this.consecutivePingFailures = 0;
+        this.maxConsecutivePingFailures = 3;
         this.timers = {
             reconnect: null,
             ping: null
@@ -122,12 +123,23 @@ class MongoConnectionManager extends EventEmitter {
             return false;
         }
         try {
-            await mongoose.connection.db.admin().ping();
+            const pingPromise = mongoose.connection.db.admin().ping();
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Ping timeout')), 5000)
+            );
+
+            await Promise.race([pingPromise, timeoutPromise]);
+            this.consecutivePingFailures = 0;
             return true;
         } catch (error) {
-            console.error('MongoDB ping failed:', error.message);
-            if (this.isConnected) {
-                this._handleDisconnected();
+            this.consecutivePingFailures++;
+            console.warn(`MongoDB ping failed (${this.consecutivePingFailures}/${this.maxConsecutivePingFailures}):`, error.message);
+
+            if (this.consecutivePingFailures >= this.maxConsecutivePingFailures) {
+                console.error('Multiple consecutive ping failures detected');
+                if (this.isConnected) {
+                    this._handleDisconnected();
+                }
             }
             return false;
         }
@@ -159,6 +171,7 @@ class MongoConnectionManager extends EventEmitter {
     _handleConnected() {
         this.isConnected = true;
         this.reconnectAttempts = 0;
+        this.consecutivePingFailures = 0;
         console.log('MongoDB connection established');
         this._startHealthCheck();
         this.emit('connected');
@@ -192,6 +205,7 @@ class MongoConnectionManager extends EventEmitter {
             const errorMsg = `Failed to reconnect after ${this.config.maxReconnectAttempts} attempts`;
             console.error(errorMsg);
             this.emit('maxReconnectAttemptsReached');
+            this.consecutivePingFailures = 0;
             return;
         }
         const exponentialDelay = this.config.reconnectInterval * Math.pow(2, this.reconnectAttempts - 1);
@@ -250,7 +264,8 @@ class MongoConnectionManager extends EventEmitter {
             stateDescription: STATE_DESCRIPTIONS[readyState] || 'unknown',
             reconnectAttempts: this.reconnectAttempts,
             reconnectScheduled: !!this.timers.reconnect,
-            healthCheckActive: !!this.timers.ping
+            healthCheckActive: !!this.timers.ping,
+            consecutivePingFailures: this.consecutivePingFailures
         };
     }
 
@@ -267,10 +282,10 @@ if (!connectionUri) {
 }
 
 const connectionManager = new MongoConnectionManager(connectionUri, {
-    pingIntervalTime: 30000,
+    pingIntervalTime: 60000,
     maxReconnectAttempts: 50,
-    reconnectInterval: 3000,
-    serverSelectionTimeoutMS: 5000,
+    reconnectInterval: 5000,
+    serverSelectionTimeoutMS: 10000,
     socketTimeoutMS: 45000
 });
 
