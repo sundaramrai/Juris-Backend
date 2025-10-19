@@ -31,7 +31,6 @@ const chatSchema = new mongoose.Schema({
       }
     }
   ],
-  chatSummary: String,
   createdAt: {
     type: Date,
     default: Date.now
