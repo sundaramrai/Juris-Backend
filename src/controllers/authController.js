@@ -134,12 +134,22 @@ exports.requestOTP = async (req, res) => {
       userData: { email, username, password }
     });
 
-    await sendOTPEmail(email, otp);
-
-    res.status(200).json({ message: "OTP sent successfully", email });
+    try {
+      await sendOTPEmail(email, otp);
+      return res.status(200).json({ message: "OTP sent successfully", email });
+    } catch (emailError) {
+      console.error("Email sending failed:", emailError);
+      otpStorage.delete(email);
+      return res.status(503).json({
+        message: "Failed to send OTP email. Please try again later or contact support.",
+        error: process.env.NODE_ENV === 'development' ? emailError.message : undefined
+      });
+    }
   } catch (error) {
-    console.error("❌ OTP Request Error:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
+    console.error("OTP Request Error:", error);
+    if (!res.headersSent) {
+      return res.status(500).json({ message: "Server error", error: error.message });
+    }
   }
 };
 
