@@ -1,5 +1,5 @@
-// src/services/aiService.js
 const { model } = require("../config/ai");
+const { getRecentLegalUpdates, formatSearchResults, searchSpecificTopic } = require('./webSearchService');
 require('node:events').EventEmitter.defaultMaxListeners = 20;
 
 const CONFIG = {
@@ -386,7 +386,7 @@ const Utils = {
     });
   },
 
-  formatResponse: (text, category, sentiment = "neutral") => {
+  formatResponse: (text, category, sentiment = "neutral", hasRealtimeData = false) => {
     let formatted = text.trim();
 
     const sentimentPrefixes = {
@@ -399,11 +399,15 @@ const Utils = {
       formatted = sentimentPrefixes[sentiment] + formatted;
     }
 
-    formatted += "\n\n**Disclaimer**: This information is for general guidance only and should not be construed as professional legal advice. For specific legal issues, please consult with a qualified lawyer.";
+    if (!hasRealtimeData) {
+      formatted += "\n\n**Note**: This is general legal information. For advice specific to your situation, please consult a qualified lawyer.";
+    }
 
-    const resources = LEGAL_RESOURCES[category] || LEGAL_RESOURCES.general;
-    if (resources.length > 0) {
-      formatted += "\n\n**Helpful Resources**:\n- " + resources.join("\n- ");
+    if (!hasRealtimeData && category !== "general") {
+      const resources = LEGAL_RESOURCES[category] || LEGAL_RESOURCES.general;
+      if (resources.length > 0) {
+        formatted += "\n\n**Related Resources**:\n" + resources.slice(0, 3).map(r => `• ${r}`).join("\n");
+      }
     }
 
     return formatted;
@@ -605,19 +609,81 @@ const ResponseGenerator = {
     metrics.aiCalls++;
     const startTime = Date.now();
 
-    const systemPrompt = `[SYSTEM: You are Juris, an expert legal assistant for Indian law. Provide accurate, clear information. Cite specific laws when relevant. Avoid jargon and explain complex terms. Structure answers clearly.]\n\n`;
+    const isRecentQuery = /202[4-9]|latest|recent|current|new|update/i.test(prompt);
+    const isSpecificTopicQuery = /about|regarding|concerning|explain|what is|tell me about/i.test(prompt);
 
-    const contextPrompt = `[CONTEXT: ${classification.subCategory || 'general'} law, ${classification.sentiment} sentiment, ${classification.requestType} request, complexity ${classification.complexity || 1}/5]\n\n`;
+    const buildMainPrompt = () => {
+      const systemPrompt = `[SYSTEM: You are Juris, an expert legal assistant for Indian law. Provide accurate, clear information. Cite specific laws when relevant. Avoid jargon and explain complex terms. Structure answers clearly. When discussing recent developments, seamlessly integrate real-time information without mentioning knowledge cutoff dates. Present all information as current and authoritative.]\n\n`;
+      const contextPrompt = `[CONTEXT: ${classification.subCategory || 'general'} law, ${classification.sentiment} sentiment, ${classification.requestType} request, complexity ${classification.complexity || 1}/5]\n\n`;
 
-    let mainPrompt = systemPrompt + contextPrompt + prompt;
+      let main = systemPrompt + contextPrompt;
+      if (isRecentQuery) {
+        main += `[NOTE: This query asks about recent information. Real-time updates will be provided. Present the information naturally without mentioning data sources or limitations.]\n\n`;
+      }
+      main += prompt;
+      if (classification.isEmergency) {
+        main = `[URGENT: Prioritize immediate actionable steps]\n\n` + main;
+      }
+      return main;
+    };
 
-    if (classification.isEmergency) {
-      mainPrompt = `[URGENT: Prioritize immediate actionable steps]\n\n` + mainPrompt;
-    }
+    const fetchRealtimeResults = async () => {
+      if (!classification.isLegal) return null;
+
+      if (isRecentQuery) {
+        return await getRecentLegalUpdates(classification.subCategory || 'general', {
+          deepSearch: true,
+          useCustomEngine: true
+        });
+      }
+
+      if (isSpecificTopicQuery) {
+        const topicMatch = prompt.match(/(?:about|regarding|concerning|explain|what is|tell me about)\s+(.+?)(?:\?|$)/i);
+        if (!topicMatch) return null;
+        const topic = topicMatch[1].trim();
+        const results = await searchSpecificTopic(topic, {
+          deepSearch: true,
+          includeRelated: true,
+          useCustomEngine: true
+        });
+        if (results && typeof results === 'object' && results.main) {
+          return [...results.main, ...(results.related || [])];
+        }
+        return results;
+      }
+
+      return null;
+    };
+
+    const cleanProcessedWithRealtime = (text, realtimeResults) => {
+      if (!realtimeResults || realtimeResults.length === 0) return text;
+
+      const patterns = [
+        /As an AI.*?July 202\d\.?\s*/gi,
+        /my knowledge.*?202\d\.?\s*/gi,
+        /I (?:cannot|don't|do not) have.*?(?:recent|latest|current|updated).*?\.\s*/gi,
+        /Therefore.*?real-time updates.*?\.\s*/gi,
+        /Accessing that information would require.*?\.\s*/gi,
+        /To get (?:the )?information you need.*?\.\s*/gi,
+        /I recommend the following:.*?(?=\n\n|\*\*|$)/gis
+      ];
+
+      let p = text;
+      for (const pat of patterns) p = p.replaceAll(pat, '');
+      p += '\n\n**Additional Resources from Recent Developments:**\n';
+      p += formatSearchResults(realtimeResults, {
+        maxResults: 5,
+        showStats: false
+      });
+      return p;
+    };
 
     try {
+      const mainPrompt = buildMainPrompt();
+      const realtimeResults = await fetchRealtimeResults();
+
       const result = await RetryHandler.execute(() => model.generateContent(mainPrompt), 2);
-      const text = result.response?.text?.() ||
+      let text = result.response?.text?.() ||
         result.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
         result.text?.();
 
@@ -626,15 +692,18 @@ const ResponseGenerator = {
       metrics.responseTimes.push(responseTime);
       if (metrics.responseTimes.length > 100) metrics.responseTimes.shift();
 
-      let processed = text;
-      if (classification.isEmergency || (classification.complexity || 1) >= 4) {
-        processed = Utils.simplifyLegalTerms(text);
-      }
+      let processed = (classification.isEmergency || (classification.complexity || 1) >= 4)
+        ? Utils.simplifyLegalTerms(text)
+        : text;
 
+      processed = cleanProcessedWithRealtime(processed, realtimeResults);
+
+      const hasRealtimeData = realtimeResults && realtimeResults.length > 0;
       const formatted = Utils.formatResponse(
         processed,
         classification.subCategory || "general",
-        classification.sentiment
+        classification.sentiment,
+        hasRealtimeData
       );
 
       return caches.response.set(cacheKey, formatted, classification.isLegal);
@@ -750,30 +819,43 @@ async function processQuery(query) {
   }
 }
 
-async function generateChatSummary(messages) {
-  if (!messages || messages.length === 0) {
-    return "No conversation to summarize";
+async function generateChatTitle(query, classification) {
+  if (classification.isLegal) {
+    const categoryTitles = {
+      criminal: 'Criminal Law',
+      civil: 'Civil Matter',
+      family: 'Family Law',
+      constitutional: 'Constitutional Issue',
+      property: 'Property Matter',
+      labor: 'Employment Issue',
+      tax: 'Tax Query',
+      consumer: 'Consumer Rights',
+      motor_vehicle: 'Vehicle Matter',
+      banking: 'Banking Issue'
+    };
+
+    const categoryLabel = categoryTitles[classification.subCategory] || 'Legal Query';
+
+    const legalTerms = ['IPC', 'CrPC', 'CPC', 'GST', 'RERA', 'FIR', 'PIL', 'RTI'];
+    const foundTerm = legalTerms.find(term => query.toUpperCase().includes(term));
+
+    if (foundTerm) {
+      return `${categoryLabel}: ${foundTerm}`;
+    }
+
+    const words = query.trim().split(/\s+/).slice(0, 6).join(' ');
+    if (words.length <= 50) {
+      return words;
+    }
+
+    return categoryLabel;
   }
 
-  const recentMessages = messages.slice(-10);
-  const chatText = recentMessages
-    .map((msg) => `${msg.type === "user" ? "User:" : "Bot:"} ${msg.text}`)
-    .join("\n");
-
-  const prompt = `Summarize this legal conversation in exactly 6 words:\n\n${chatText}`;
-
-  try {
-    let summary = await ResponseGenerator.legal(prompt, {
-      isLegal: false,
-      category: "general_chat"
-    });
-    summary = summary.trim().replaceAll(/[^a-zA-Z0-9\s]/g, "").replaceAll(/\s+/g, " ");
-    const words = summary.split(" ").filter(w => w.length > 0).slice(0, 6);
-    return words.join(" ");
-  } catch (error) {
-    console.error("Error generating chat summary:", error);
-    return "Summary unavailable";
+  if (query.length <= 50) {
+    return query;
   }
+
+  return query.substring(0, 47) + '...';
 }
 
 async function batchProcessQueries(queries) {
@@ -884,7 +966,7 @@ function getServiceMetrics() {
 
 module.exports = {
   processQuery,
-  generateChatSummary,
+  generateChatTitle,
   batchProcessQueries,
   isLegalQuery: (query) => Classifier.basic(query).isLegal,
   classifyQuery: Classifier.basic,
