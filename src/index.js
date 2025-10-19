@@ -119,14 +119,25 @@ app.use((err, req, res, next) => {
 
 let server;
 const SHUTDOWN_TIMEOUT = 10000;
+let isShuttingDown = false;
 
-const shutdown = (signal) => (error) => {
-  if (error) console.error(`${signal} error:`, error);
+const shutdown = (signal) => async (error) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  if (error && signal !== 'SIGINT' && signal !== 'SIGTERM') {
+    console.error(`${signal}:`, error);
+  }
   console.log(`${signal} received. Shutting down gracefully...`);
 
   const dbConnection = require('./config/dbConnection');
   if (dbConnection) {
-    dbConnection.disconnect().catch(err => console.error('DB disconnect error:', err));
+    try {
+      await dbConnection.disconnect();
+      console.log('Database disconnected successfully');
+    } catch (err) {
+      console.error('DB disconnect error:', err);
+    }
   }
 
   if (server) {
@@ -155,9 +166,19 @@ const shutdown = (signal) => (error) => {
     server.keepAliveTimeout = 65000;
     server.headersTimeout = 66000;
 
-    for (const signal of ["SIGINT", "SIGTERM", "uncaughtException", "unhandledRejection"]) {
+    for (const signal of ["SIGINT", "SIGTERM"]) {
       process.on(signal, shutdown(signal));
     }
+
+    process.on("uncaughtException", (error) => {
+      console.error('Uncaught Exception:', error);
+      shutdown("uncaughtException")(error);
+    });
+
+    process.on("unhandledRejection", (reason, promise) => {
+      console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+      shutdown("unhandledRejection")(reason);
+    });
   } catch (err) {
     console.error('Database connection failed:', err);
     process.exit(1);
