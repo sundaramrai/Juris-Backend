@@ -5,9 +5,6 @@ function validateEnvVars() {
     "GEMINI_API_KEY",
     "ENCRYPTION_KEY",
     "USERNAME_HASH_SALT",
-    "EMAIL_USER",
-    "EMAIL_PASS",
-    "OTP_SECRET",
     "GOOGLE_SEARCH_ENGINE_ID",
     "GOOGLE_SEARCH_API_KEY"
   ];
