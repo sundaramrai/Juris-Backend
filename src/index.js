@@ -124,6 +124,11 @@ const shutdown = (signal) => (error) => {
   if (error) console.error(`${signal} error:`, error);
   console.log(`${signal} received. Shutting down gracefully...`);
 
+  const dbConnection = require('./config/dbConnection');
+  if (dbConnection) {
+    dbConnection.disconnect().catch(err => console.error('DB disconnect error:', err));
+  }
+
   if (server) {
     const forceShutdown = setTimeout(() => {
       console.error('Forced shutdown due to timeout');
