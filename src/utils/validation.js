@@ -7,7 +7,9 @@ function validateEnvVars() {
     "USERNAME_HASH_SALT",
     "EMAIL_USER",
     "EMAIL_PASS",
-    "OTP_SECRET"
+    "OTP_SECRET",
+    "GOOGLE_SEARCH_ENGINE_ID",
+    "GOOGLE_SEARCH_API_KEY"
   ];
   const missingVars = requiredEnvVars.filter(key => !process.env[key]);
   if (missingVars.length > 0) {
