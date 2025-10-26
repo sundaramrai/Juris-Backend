@@ -13,7 +13,9 @@ const { validateEnvVars } = require("./utils/validation");
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const isProduction = NODE_ENV === 'production';
-const allowedOrigins = process.env.CORS_ORIGINS?.split(',').filter(Boolean) || [];
+const allowedOrigins = process.env.CORS_ORIGINS?.split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean) || [];
 
 validateEnvVars();
 
@@ -69,7 +71,7 @@ app.use(cors({
       return callback(null, originCache.get(origin));
     }
     const isAllowed = (!isProduction && origin.startsWith('http://localhost:')) ||
-      allowedOrigins.includes(origin);
+      allowedOrigins.includes(origin.trim());
     originCache.set(origin, isAllowed);
     callback(null, isAllowed);
   },
