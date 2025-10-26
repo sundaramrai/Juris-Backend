@@ -65,16 +65,7 @@ app.use(compression({
 
 const originCache = new Map();
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (originCache.has(origin)) {
-      return callback(null, originCache.get(origin));
-    }
-    const isAllowed = (!isProduction && origin.startsWith('http://localhost:')) ||
-      allowedOrigins.includes(origin.trim());
-    originCache.set(origin, isAllowed);
-    callback(null, isAllowed);
-  },
+  origin: true, // Allow all origins
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
