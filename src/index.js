@@ -13,14 +13,20 @@ const { validateEnvVars } = require("./utils/validation");
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const isProduction = NODE_ENV === 'production';
+const rawCorsOrigins = process.env.CORS_ORIGINS || '';
+console.log('Raw CORS_ORIGINS env:', rawCorsOrigins);
+
 const allowedOrigins = new Set(
-  (process.env.CORS_ORIGINS || '')
+  rawCorsOrigins
     .split(',')
     .map(origin => origin.trim())
     .filter(Boolean)
 );
 
 console.log('Allowed CORS origins:', Array.from(allowedOrigins));
+Array.from(allowedOrigins).forEach((origin, idx) => {
+  console.log(`Allowed Origin [${idx}]: "${origin}"`);
+});
 
 validateEnvVars();
 
@@ -65,6 +71,8 @@ function setupMiddleware(app) {
   const originCache = new Map();
   app.use(cors({
     origin: (origin, callback) => {
+      console.log(`[CORS] Incoming Origin: "${origin}"`);
+      console.log(`[CORS] Allowed Origins:`, Array.from(allowedOrigins));
       if (!origin) return callback(null, true);
       if (originCache.has(origin)) {
         console.log(`[CORS] Origin: ${origin} Allowed: ${originCache.get(origin)}`);
