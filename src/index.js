@@ -20,6 +20,8 @@ const allowedOrigins = new Set(
     .filter(Boolean)
 );
 
+console.log('Allowed CORS origins:', Array.from(allowedOrigins));
+
 validateEnvVars();
 
 const app = express();
@@ -64,11 +66,18 @@ function setupMiddleware(app) {
   app.use(cors({
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
-      if (originCache.has(origin)) return callback(null, originCache.get(origin));
+      if (originCache.has(origin)) {
+        console.log(`[CORS] Origin: ${origin} Allowed: ${originCache.get(origin)}`);
+        return callback(null, originCache.get(origin));
+      }
       const isAllowed = (!isProduction && origin.startsWith('http://localhost:')) ||
         allowedOrigins.has(origin);
       originCache.set(origin, isAllowed);
-      callback(null, isAllowed);
+      console.log(`[CORS] Origin: ${origin} Allowed: ${isAllowed}`);
+      if (!isAllowed) {
+        return callback(new Error('Not allowed by CORS'), false);
+      }
+      callback(null, true);
     },
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
     allowedHeaders: ["Content-Type", "Authorization"],
