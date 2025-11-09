@@ -9,8 +9,10 @@ class RateLimiter {
     }
 
     _getClientIp(req) {
-        return req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-            req.socket.remoteAddress;
+        return (
+            req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
+            req.socket.remoteAddress
+        );
     }
 
     setLimit(ip, maxRequests, windowMs = this.defaultLimits.windowMs) {
@@ -34,19 +36,24 @@ class RateLimiter {
             }
             const requests = this.requests.get(ip);
 
-            const validRequests = requests.filter(timestamp => now - timestamp < windowMs);
+            const validRequests = requests.filter(
+                (timestamp) => now - timestamp < windowMs
+            );
             if (validRequests.length >= maxRequests) {
                 return res.status(429).json({
-                    error: 'Too many requests, please try again later',
-                    retryAfter: Math.ceil((validRequests[0] + windowMs - now) / 1000)
+                    error: "Too many requests, please try again later",
+                    retryAfter: Math.ceil((validRequests[0] + windowMs - now) / 1000),
                 });
             }
 
             validRequests.push(now);
             this.requests.set(ip, validRequests);
-            res.setHeader('X-RateLimit-Limit', maxRequests);
-            res.setHeader('X-RateLimit-Remaining', maxRequests - validRequests.length);
-            res.setHeader('X-RateLimit-Reset', Math.ceil((now + windowMs) / 1000));
+            res.setHeader("X-RateLimit-Limit", maxRequests);
+            res.setHeader(
+                "X-RateLimit-Remaining",
+                maxRequests - validRequests.length
+            );
+            res.setHeader("X-RateLimit-Reset", Math.ceil((now + windowMs) / 1000));
 
             next();
         };
@@ -56,7 +63,7 @@ class RateLimiter {
         const stats = {
             totalTrackedIps: this.requests.size,
             customLimits: this.ipLimits.size,
-            ipDetails: {}
+            ipDetails: {},
         };
 
         for (const [ip, requests] of this.requests.entries()) {
@@ -65,7 +72,7 @@ class RateLimiter {
                 currentRequests: requests.length,
                 maxRequests: limits.maxRequests,
                 windowMs: limits.windowMs,
-                remaining: limits.maxRequests - requests.length
+                remaining: limits.maxRequests - requests.length,
             };
         }
 
@@ -74,4 +81,4 @@ class RateLimiter {
 }
 
 const rateLimiter = new RateLimiter();
-module.exports = rateLimiter;
+export default rateLimiter;
