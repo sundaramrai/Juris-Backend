@@ -1,68 +1,74 @@
-const mongoose = require('mongoose');
-const Chat = require("../models/Chat");
-const { v4: uuidv4 } = require("uuid");
-const { encryptText, decryptText } = require("../utils/encryption");
-const {
+import mongoose from "mongoose";
+import Chat from "../models/Chat.js";
+import { v4 as uuidv4 } from "uuid";
+import { encryptText, decryptText } from "../utils/encryption.js";
+import {
   generateChatTitle,
   processQuery,
   getServiceMetrics,
   withRetry,
-  prioritizeQuery
-} = require("../services/aiService");
-const lockManager = require('../utils/lockManager');
-const dbConnection = require('../config/dbConnection');
-const LRUCache = require('../utils/lruCache');
+  prioritizeQuery,
+} from "../services/aiService.js";
+import lockManager from "../utils/lockManager.js";
+import dbConnection from "../config/dbConnection.js";
+import LRUCache from "../utils/lruCache.js";
 
 const chatCache = new LRUCache({ maxSize: 100, ttlMs: 15 * 60 * 1000 });
 
 const handleError = (res, error, message, statusCode = 500) => {
   const errorId = uuidv4().substring(0, 8);
-  console.error(`❌ [${errorId}] ${message}:`, error);
+  console.error(`[${errorId}] ${message}:`, error);
 
   const errorMap = {
     AIServiceError: 503,
     ValidationError: 400,
     AuthorizationError: 403,
     MongoNetworkError: 503,
-    MongoTimeoutError: 503
+    MongoTimeoutError: 503,
   };
 
   const code = errorMap[error.name] || statusCode;
 
   return res.status(code).json({
-    message: error.name in errorMap ? `${error.name.replace('Error', '')} error occurred` : message,
+    message:
+      error.name in errorMap
+        ? `${error.name.replace("Error", "")} error occurred`
+        : message,
     errorId,
-    ...(process.env.NODE_ENV === 'development' && {
+    ...(process.env.NODE_ENV === "development" && {
       error: error.message,
-      stack: error.stack
-    })
+      stack: error.stack,
+    }),
   });
 };
 
 const getCacheKey = (userId, chatId) => `${userId}:${chatId}`;
 
-const getCachedChat = (userId, chatId) => chatCache.get(getCacheKey(userId, chatId));
+const getCachedChat = (userId, chatId) =>
+  chatCache.get(getCacheKey(userId, chatId));
 
-const setCachedChat = (userId, chatId, data) => chatCache.set(getCacheKey(userId, chatId), data);
+const setCachedChat = (userId, chatId, data) =>
+  chatCache.set(getCacheKey(userId, chatId), data);
 
-const invalidateUserCache = (userId) => chatCache.invalidatePrefix(`${userId}:`);
+const invalidateUserCache = (userId) =>
+  chatCache.invalidatePrefix(`${userId}:`);
 
 const decryptMessages = (messages) => {
   if (!messages?.length) return [];
 
-  return messages.map(msg => {
+  return messages.map((msg) => {
     try {
       const msgObj = msg.toObject?.() || msg;
       return {
         ...msgObj,
-        text: decryptText(msgObj.text)
+        text: decryptText(msgObj.text),
       };
     } catch (error) {
-      console.error('Message decryption failed:', error.message);
+      console.error("Message decryption failed:", error.message);
       return {
         ...(msg.toObject?.() || msg),
-        text: '[Decryption failed]',
-        error: true
+        text: "[Decryption failed]",
+        error: true,
       };
     }
   });
@@ -72,17 +78,28 @@ const executeDbOperation = async (operation, retries = 2) => {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       if (mongoose.connection.readyState !== 1) {
-        console.warn(`DB not ready (state: ${mongoose.connection.readyState}), attempting reconnect...`);
+        console.warn(
+          `DB not ready (state: ${mongoose.connection.readyState}), attempting reconnect...`
+        );
         await dbConnection.connect();
       }
 
       return await operation();
     } catch (error) {
-      const isConnectionError = ['MongoNetworkError', 'MongoTimeoutError', 'MongoServerSelectionError'].includes(error.name);
+      const isConnectionError = [
+        "MongoNetworkError",
+        "MongoTimeoutError",
+        "MongoServerSelectionError",
+      ].includes(error.name);
 
       if (isConnectionError && attempt < retries) {
-        console.warn(`DB operation failed (attempt ${attempt + 1}/${retries + 1}):`, error.message);
-        await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        console.warn(
+          `DB operation failed (attempt ${attempt + 1}/${retries + 1}):`,
+          error.message
+        );
+        await new Promise((resolve) =>
+          setTimeout(resolve, 1000 * (attempt + 1))
+        );
         continue;
       }
       throw error;
@@ -109,16 +126,19 @@ const saveChat = async (chat, isNew = false) => {
   });
 };
 
-exports.processChat = async (req, res) => {
+export async function processChat(req, res) {
   try {
     const { message, chatId } = req.body;
     const userId = req.user.userId;
 
     if (!message?.trim()) {
-      return res.status(400).json({ message: "Message is required and cannot be empty" });
+      return res
+        .status(400)
+        .json({ message: "Message is required and cannot be empty" });
     }
 
-    const priority = message.length < 200 ? await prioritizeQuery(message) : 'normal';
+    const priority =
+      message.length < 200 ? await prioritizeQuery(message) : "normal";
     const processingStart = Date.now();
 
     const { response: botResponse, classification } = await withRetry(
@@ -135,8 +155,9 @@ exports.processChat = async (req, res) => {
     let isNewChat = false;
 
     if (chatId) {
-      chat = getCachedChat(userId, chatId) ||
-        await executeDbOperation(() => Chat.findOne({ userId, chatId }));
+      chat =
+        getCachedChat(userId, chatId) ||
+        (await executeDbOperation(() => Chat.findOne({ userId, chatId })));
     }
 
     if (!chat) {
@@ -145,7 +166,7 @@ exports.processChat = async (req, res) => {
         userId,
         chatId: uuidv4(),
         messages: [],
-        title: "New Chat"
+        title: "New Chat",
       });
     }
 
@@ -159,8 +180,12 @@ exports.processChat = async (req, res) => {
         time: timestamp,
         metadata: {
           processingTime,
-          classification: { category: classification.category, isLegal: classification.isLegal, priority }
-        }
+          classification: {
+            category: classification.category,
+            isLegal: classification.isLegal,
+            priority,
+          },
+        },
       }
     );
 
@@ -168,8 +193,9 @@ exports.processChat = async (req, res) => {
       try {
         chat.title = await generateChatTitle(message, classification);
       } catch (error) {
-        console.warn('Title generation failed:', error.message);
-        chat.title = message.length <= 50 ? message : message.substring(0, 47) + '...';
+        console.warn("Title generation failed:", error.message);
+        chat.title =
+          message.length <= 50 ? message : message.substring(0, 47) + "...";
       }
     }
 
@@ -188,23 +214,28 @@ exports.processChat = async (req, res) => {
       isLegal: classification.isLegal,
       messageCount: messageCount + 2,
       processingTime,
-      isNewChat
+      isNewChat,
     });
   } catch (error) {
     return handleError(res, error, "Error processing chat");
   }
-};
+}
 
-exports.getAllChats = async (req, res) => {
+export async function getAllChats(req, res) {
   try {
     const userId = req.user.userId;
     const page = Math.max(1, Number.parseInt(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit) || 20));
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.parseInt(req.query.limit) || 20)
+    );
     const skip = (page - 1) * limit;
 
     const filter = { userId };
-    if (req.query.startDate) filter.updatedAt = { $gte: new Date(req.query.startDate) };
-    if (req.query.keyword) filter.title = { $regex: req.query.keyword, $options: 'i' };
+    if (req.query.startDate)
+      filter.updatedAt = { $gte: new Date(req.query.startDate) };
+    if (req.query.keyword)
+      filter.title = { $regex: req.query.keyword, $options: "i" };
 
     const [chats, totalDocs] = await Promise.all([
       executeDbOperation(() =>
@@ -212,21 +243,21 @@ exports.getAllChats = async (req, res) => {
           .sort({ updatedAt: -1 })
           .skip(skip)
           .limit(limit)
-          .select('chatId title createdAt updatedAt messages')
+          .select("chatId title createdAt updatedAt messages")
           .lean()
       ),
-      executeDbOperation(() => Chat.countDocuments(filter))
+      executeDbOperation(() => Chat.countDocuments(filter)),
     ]);
 
     const formattedChats = chats
-      .filter(chat => chat.messages?.length > 0)
-      .map(chat => ({
+      .filter((chat) => chat.messages?.length > 0)
+      .map((chat) => ({
         chatId: chat.chatId,
         title: chat.title,
         messageCount: chat.messages.length,
         lastMessageTime: chat.messages.at(-1)?.time,
         createdAt: chat.createdAt,
-        updatedAt: chat.updatedAt
+        updatedAt: chat.updatedAt,
       }));
 
     res.json({
@@ -236,15 +267,15 @@ exports.getAllChats = async (req, res) => {
         limit,
         totalPages: Math.ceil(totalDocs / limit),
         totalChats: totalDocs,
-        hasMore: chats.length === limit
-      }
+        hasMore: chats.length === limit,
+      },
     });
   } catch (error) {
     return handleError(res, error, "Error fetching chats");
   }
-};
+}
 
-exports.getChatHistory = async (req, res) => {
+export async function getChatHistory(req, res) {
   try {
     const userId = req.user.userId;
     const { chatId } = req.params;
@@ -269,14 +300,14 @@ exports.getChatHistory = async (req, res) => {
       title: chat.title,
       messages: decryptMessages(chat.messages),
       createdAt: chat.createdAt,
-      updatedAt: chat.updatedAt
+      updatedAt: chat.updatedAt,
     });
   } catch (error) {
     return handleError(res, error, "Error fetching chat history");
   }
-};
+}
 
-exports.clearChatHistory = async (req, res) => {
+export async function clearChatHistory(req, res) {
   try {
     const userId = req.user.userId;
     const { chatId } = req.params;
@@ -302,17 +333,17 @@ exports.clearChatHistory = async (req, res) => {
   } catch (error) {
     return handleError(res, error, "Error clearing chat history");
   }
-};
+}
 
-exports.createNewChat = async (req, res) => {
+export async function createNewChat(req, res) {
   res.json({
     chatId: null,
     title: "New Chat",
-    messages: []
+    messages: [],
   });
-};
+}
 
-exports.updateChatTitle = async (req, res) => {
+export async function updateChatTitle(req, res) {
   try {
     const userId = req.user.userId;
     const { chatId } = req.params;
@@ -323,7 +354,9 @@ exports.updateChatTitle = async (req, res) => {
     }
 
     if (!title?.trim()) {
-      return res.status(400).json({ message: "Title is required and cannot be empty" });
+      return res
+        .status(400)
+        .json({ message: "Title is required and cannot be empty" });
     }
 
     const chat = await executeDbOperation(() =>
@@ -343,9 +376,9 @@ exports.updateChatTitle = async (req, res) => {
   } catch (error) {
     return handleError(res, error, "Error updating chat title");
   }
-};
+}
 
-exports.deleteChat = async (req, res) => {
+export async function deleteChat(req, res) {
   try {
     const userId = req.user.userId;
     const { chatId } = req.params;
@@ -367,9 +400,9 @@ exports.deleteChat = async (req, res) => {
   } catch (error) {
     return handleError(res, error, "Error deleting chat");
   }
-};
+}
 
-exports.getServiceStatus = async (req, res) => {
+export async function getServiceStatus(req, res) {
   if (!req.user.isAdmin) {
     return res.status(403).json({ message: "Unauthorized" });
   }
@@ -383,12 +416,14 @@ exports.getServiceStatus = async (req, res) => {
           Chat.countDocuments(),
           Chat.aggregate([
             { $project: { messageCount: { $size: "$messages" } } },
-            { $group: { _id: null, avg: { $avg: "$messageCount" } } }
-          ]).then(result => result[0]?.avg || 0),
-          Chat.countDocuments({ updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } })
+            { $group: { _id: null, avg: { $avg: "$messageCount" } } },
+          ]).then((result) => result[0]?.avg || 0),
+          Chat.countDocuments({
+            updatedAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+          }),
         ]);
         return { chatCount, avgChatSize: Math.round(avgSize), recentActivity };
-      })
+      }),
     ]);
 
     res.json({
@@ -400,9 +435,9 @@ exports.getServiceStatus = async (req, res) => {
         memoryUsage: process.memoryUsage(),
         uptime: Math.round(process.uptime()),
       },
-      aiService: metrics.api
+      aiService: metrics.api,
     });
   } catch (error) {
     return handleError(res, error, "Error fetching service status");
   }
-};
+}
