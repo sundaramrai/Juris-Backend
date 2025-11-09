@@ -22,7 +22,7 @@
   ],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
   "description": "",
   "dependencies": {
     "@google/generative-ai": "^0.22.0",
