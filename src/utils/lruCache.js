@@ -11,7 +11,7 @@ class LRUCache {
             hits: 0,
             misses: 0,
             evictions: 0,
-            estimatedMemoryBytes: 0
+            estimatedMemoryBytes: 0,
         };
     }
 
@@ -35,7 +35,8 @@ class LRUCache {
         const now = Date.now();
         const itemSize = this._estimateSize(value);
         while (
-            this.metrics.estimatedMemoryBytes + itemSize > this.config.maxMemoryMB * 1024 * 1024 &&
+            this.metrics.estimatedMemoryBytes + itemSize >
+            this.config.maxMemoryMB * 1024 * 1024 &&
             this.cache.size > 0
         ) {
             this._evictOldest();
@@ -49,7 +50,7 @@ class LRUCache {
         this.cache.set(key, {
             value,
             expiry: now + this.config.ttlMs,
-            size: itemSize
+            size: itemSize,
         });
 
         this.metrics.estimatedMemoryBytes += itemSize;
@@ -64,7 +65,9 @@ class LRUCache {
     }
 
     invalidatePrefix(prefix) {
-        const keysToDelete = Array.from(this.cache.keys()).filter(key => key.startsWith(prefix));
+        const keysToDelete = Array.from(this.cache.keys()).filter((key) =>
+            key.startsWith(prefix)
+        );
         for (const key of keysToDelete) {
             this.delete(key);
         }
@@ -85,9 +88,12 @@ class LRUCache {
             hits: this.metrics.hits,
             misses: this.metrics.misses,
             evictions: this.metrics.evictions,
-            hitRate: (hitRate * 100).toFixed(2) + '%',
-            memoryUsageMB: (this.metrics.estimatedMemoryBytes / (1024 * 1024)).toFixed(2),
-            maxMemoryMB: this.config.maxMemoryMB
+            hitRate: (hitRate * 100).toFixed(2) + "%",
+            memoryUsageMB: (
+                this.metrics.estimatedMemoryBytes /
+                (1024 * 1024)
+            ).toFixed(2),
+            maxMemoryMB: this.config.maxMemoryMB,
         };
     }
 
@@ -118,4 +124,4 @@ class LRUCache {
     }
 }
 
-module.exports = LRUCache;
+export default LRUCache;
