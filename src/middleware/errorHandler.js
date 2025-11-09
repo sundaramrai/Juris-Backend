@@ -12,11 +12,13 @@ class ErrorHandler {
             path: req.path,
             method: req.method,
             ip: req.ip,
-            userAgent: req.get('user-agent'),
-            body: this._sanitizeRequestBody(req.body)
+            userAgent: req.get("user-agent"),
+            body: this._sanitizeRequestBody(req.body),
         };
 
-        console.error(`[ERROR] ${errorDetails.timestamp} - ${errorDetails.method} ${errorDetails.path} - ${errorDetails.error}`);
+        console.error(
+            `[ERROR] ${errorDetails.timestamp} - ${errorDetails.method} ${errorDetails.path} - ${errorDetails.error}`
+        );
         this.errorLog.unshift(errorDetails);
         if (this.errorLog.length > this.maxLogSize) {
             this.errorLog.pop();
@@ -28,10 +30,16 @@ class ErrorHandler {
     _sanitizeRequestBody(body) {
         if (!body) return {};
         const sanitized = { ...body };
-        const sensitiveFields = ['password', 'token', 'apiKey', 'secret', 'creditCard'];
+        const sensitiveFields = [
+            "password",
+            "token",
+            "apiKey",
+            "secret",
+            "creditCard",
+        ];
         for (const field of sensitiveFields) {
             if (field in sanitized) {
-                sanitized[field] = '[REDACTED]';
+                sanitized[field] = "[REDACTED]";
             }
         }
 
@@ -42,14 +50,15 @@ class ErrorHandler {
         return (err, req, res, next) => {
             const errorDetails = this.logError(err, req);
             const statusCode = err.statusCode || 500;
-            const isDevelopment = process.env.NODE_ENV !== 'production';
+            const isDevelopment = process.env.NODE_ENV !== "production";
 
             const errorResponse = {
                 error: true,
-                message: statusCode === 500 ?
-                    'An unexpected error occurred. Our team has been notified.' :
-                    err.message,
-                errorId: errorDetails.timestamp
+                message:
+                    statusCode === 500
+                        ? "An unexpected error occurred. Our team has been notified."
+                        : err.message,
+                errorId: errorDetails.timestamp,
             };
 
             if (isDevelopment && err.stack) {
@@ -67,7 +76,5 @@ class ErrorHandler {
 
 const errorHandler = new ErrorHandler();
 
-module.exports = {
-    errorHandler,
-    errorMiddleware: errorHandler.getErrorMiddleware()
-};
+export { errorHandler };
+export const errorMiddleware = errorHandler.getErrorMiddleware();
