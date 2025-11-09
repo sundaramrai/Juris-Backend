@@ -1,6 +1,11 @@
-const { model } = require("../config/ai");
-const { getRecentLegalUpdates, formatSearchResults, searchSpecificTopic } = require('./webSearchService');
-require('node:events').EventEmitter.defaultMaxListeners = 20;
+import { model } from "../config/ai.js";
+import {
+  getRecentLegalUpdates,
+  formatSearchResults,
+  searchSpecificTopic,
+} from "./webSearchService.js";
+import { EventEmitter } from "node:events";
+EventEmitter.defaultMaxListeners = 20;
 
 const CONFIG = {
   CACHE: {
@@ -12,66 +17,255 @@ const CONFIG = {
     RETRY_DELAY: 1000,
     TIMEOUT: 15000,
     MAX_CONCURRENT: 10,
-    BATCH_SIZE: 5
+    BATCH_SIZE: 5,
   },
   HEALTH: {
     CHECK_INTERVAL: 30000,
-    MAX_CONSECUTIVE_ERRORS: 3
-  }
+    MAX_CONSECUTIVE_ERRORS: 3,
+  },
 };
 
 const REGEX = {
-  INDIAN_LANGUAGE: /[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B00-\u0BFF]|\u0C00|[\u0C01-\u0C7F]|\u0C80|[\u0C81-\u0CFF]|\u0D00|[\u0D01-\u0D7F]/,
+  INDIAN_LANGUAGE:
+    /[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B00-\u0BFF]|\u0C00|[\u0C01-\u0C7F]|\u0C80|[\u0C81-\u0CFF]|\u0D00|[\u0D01-\u0D7F]/,
   EMERGENCY: /urgent|emergency|immediately|asap|right now|hurry|quickly/i,
-  FRUSTRATED: /frustrated|angry|upset|annoyed|ridiculous|absurd|unfair|terrible/i,
-  CONFUSED: /confused|don't understand|what does this mean|explain|clarify|unclear/i,
+  FRUSTRATED:
+    /frustrated|angry|upset|annoyed|ridiculous|absurd|unfair|terrible/i,
+  CONFUSED:
+    /confused|don't understand|what does this mean|explain|clarify|unclear/i,
   POSITIVE: /please|thank you|thanks|appreciate|grateful|kind|helpful/i,
   GREETING: /^(hi|hello|namaste|greetings|hey)(\s|$)/i,
   ABOUT: /who are you|what are you|what can you do|what is this|what is juris/i,
   CAPABILITIES: /what can you (help|do)|how can you help|your capabilities/i,
-  THANKS: /thank|thanks|grateful|appreciate/i
+  THANKS: /thank|thanks|grateful|appreciate/i,
 };
 
 const KEYWORDS = {
   legal: new Set([
-    "law", "legal", "act", "section", "court", "constitution", "rights",
-    "criminal", "civil", "contract", "divorce", "property", "injunction",
-    "notice", "case", "litigation", "dispute", "judicial", "article",
-    "accident", "injury", "traffic", "offence", "arrest", "bail", "sentence",
-    "appeal", "petition", "writ", "hearing", "tribunal", "authority",
-    "jurisdiction", "complaint", "plaintiff", "defendant", "lawyer", "advocate",
-    "attorney", "counsel", "judge", "justice", "trial", "order", "judgment",
-    "decree", "evidence", "witness", "testimony", "verdict", "conviction",
-    "acquittal", "settlement", "mediation", "arbitration", "IPC", "CrPC",
-    "CPC", "PIL", "FIR", "RTI", "GST", "RERA", "SEBI", "RBI", "POCSO",
-    "NDPS", "PMLA", "IBC", "SARFAESI", "NI Act", "cheque bounce", "dowry",
-    "domestic violence", "maintenance", "alimony", "custody", "guardianship"
+    "law",
+    "legal",
+    "act",
+    "section",
+    "court",
+    "constitution",
+    "rights",
+    "criminal",
+    "civil",
+    "contract",
+    "divorce",
+    "property",
+    "injunction",
+    "notice",
+    "case",
+    "litigation",
+    "dispute",
+    "judicial",
+    "article",
+    "accident",
+    "injury",
+    "traffic",
+    "offence",
+    "arrest",
+    "bail",
+    "sentence",
+    "appeal",
+    "petition",
+    "writ",
+    "hearing",
+    "tribunal",
+    "authority",
+    "jurisdiction",
+    "complaint",
+    "plaintiff",
+    "defendant",
+    "lawyer",
+    "advocate",
+    "attorney",
+    "counsel",
+    "judge",
+    "justice",
+    "trial",
+    "order",
+    "judgment",
+    "decree",
+    "evidence",
+    "witness",
+    "testimony",
+    "verdict",
+    "conviction",
+    "acquittal",
+    "settlement",
+    "mediation",
+    "arbitration",
+    "IPC",
+    "CrPC",
+    "CPC",
+    "PIL",
+    "FIR",
+    "RTI",
+    "GST",
+    "RERA",
+    "SEBI",
+    "RBI",
+    "POCSO",
+    "NDPS",
+    "PMLA",
+    "IBC",
+    "SARFAESI",
+    "NI Act",
+    "cheque bounce",
+    "dowry",
+    "domestic violence",
+    "maintenance",
+    "alimony",
+    "custody",
+    "guardianship",
   ]),
 
   nonLegal: {
-    general_chat: new Set(["hello", "hi", "how are you", "your name", "who are you", "thanks"]),
-    technical_support: new Set(["error", "bug", "not working", "problem", "fix", "broken"]),
+    general_chat: new Set([
+      "hello",
+      "hi",
+      "how are you",
+      "your name",
+      "who are you",
+      "thanks",
+    ]),
+    technical_support: new Set([
+      "error",
+      "bug",
+      "not working",
+      "problem",
+      "fix",
+      "broken",
+    ]),
     feedback: new Set(["feedback", "suggestion", "improve", "rate", "review"]),
-    related_services: new Set(["government", "policy", "document", "application", "form"])
+    related_services: new Set([
+      "government",
+      "policy",
+      "document",
+      "application",
+      "form",
+    ]),
   },
 
   emergency: new Set([
-    "arrested", "detention", "police custody", "urgent bail", "domestic violence",
-    "immediate danger", "threats", "abuse", "emergency protection", "assault"
-  ])
+    "arrested",
+    "detention",
+    "police custody",
+    "urgent bail",
+    "domestic violence",
+    "immediate danger",
+    "threats",
+    "abuse",
+    "emergency protection",
+    "assault",
+  ]),
 };
 
 const LEGAL_CATEGORIES = {
-  criminal: new Set(["IPC", "CrPC", "FIR", "arrest", "bail", "theft", "murder", "assault", "POCSO", "rape", "kidnap", "fraud", "NDPS"]),
-  civil: new Set(["CPC", "contract", "property", "tenancy", "rent", "lease", "partition", "succession", "injunction", "possession"]),
-  family: new Set(["marriage", "divorce", "custody", "maintenance", "adoption", "guardianship", "alimony", "domestic violence"]),
-  constitutional: new Set(["fundamental rights", "writ", "article", "constitution", "PIL", "supreme court", "high court"]),
-  property: new Set(["property", "land", "registration", "stamp duty", "RERA", "mutation", "title deed", "mortgage"]),
-  labor: new Set(["salary", "wages", "bonus", "gratuity", "PF", "ESI", "termination", "unfair dismissal"]),
-  tax: new Set(["income tax", "GST", "service tax", "TDS", "returns", "assessment", "appeal"]),
-  consumer: new Set(["consumer", "deficiency", "product", "service", "refund", "warranty"]),
-  motor_vehicle: new Set(["accident", "compensation", "insurance", "motor vehicle", "license", "challan", "MACT"]),
-  banking: new Set(["loan", "mortgage", "NPA", "recovery", "DRT", "SARFAESI", "cheque bounce", "138 NI Act"])
+  criminal: new Set([
+    "IPC",
+    "CrPC",
+    "FIR",
+    "arrest",
+    "bail",
+    "theft",
+    "murder",
+    "assault",
+    "POCSO",
+    "rape",
+    "kidnap",
+    "fraud",
+    "NDPS",
+  ]),
+  civil: new Set([
+    "CPC",
+    "contract",
+    "property",
+    "tenancy",
+    "rent",
+    "lease",
+    "partition",
+    "succession",
+    "injunction",
+    "possession",
+  ]),
+  family: new Set([
+    "marriage",
+    "divorce",
+    "custody",
+    "maintenance",
+    "adoption",
+    "guardianship",
+    "alimony",
+    "domestic violence",
+  ]),
+  constitutional: new Set([
+    "fundamental rights",
+    "writ",
+    "article",
+    "constitution",
+    "PIL",
+    "supreme court",
+    "high court",
+  ]),
+  property: new Set([
+    "property",
+    "land",
+    "registration",
+    "stamp duty",
+    "RERA",
+    "mutation",
+    "title deed",
+    "mortgage",
+  ]),
+  labor: new Set([
+    "salary",
+    "wages",
+    "bonus",
+    "gratuity",
+    "PF",
+    "ESI",
+    "termination",
+    "unfair dismissal",
+  ]),
+  tax: new Set([
+    "income tax",
+    "GST",
+    "service tax",
+    "TDS",
+    "returns",
+    "assessment",
+    "appeal",
+  ]),
+  consumer: new Set([
+    "consumer",
+    "deficiency",
+    "product",
+    "service",
+    "refund",
+    "warranty",
+  ]),
+  motor_vehicle: new Set([
+    "accident",
+    "compensation",
+    "insurance",
+    "motor vehicle",
+    "license",
+    "challan",
+    "MACT",
+  ]),
+  banking: new Set([
+    "loan",
+    "mortgage",
+    "NPA",
+    "recovery",
+    "DRT",
+    "SARFAESI",
+    "cheque bounce",
+    "138 NI Act",
+  ]),
 };
 
 const LEGAL_RESOURCES = {
@@ -79,85 +273,91 @@ const LEGAL_RESOURCES = {
     "National Legal Services Authority (NALSA): https://nalsa.gov.in",
     "Police Helpline: 100",
     "Women Helpline: 1091",
-    "Child Helpline: 1098"
+    "Child Helpline: 1098",
   ],
   civil: [
     "E-Courts Services Portal: https://ecourts.gov.in",
     "National Judicial Data Grid: https://njdg.ecourts.gov.in",
-    "Lok Adalats"
+    "Lok Adalats",
   ],
   family: [
     "Family Courts",
     "National Commission for Women: 7827170170",
-    "Central Adoption Resource Authority: http://cara.nic.in"
+    "Central Adoption Resource Authority: http://cara.nic.in",
   ],
   constitutional: [
     "Supreme Court: https://main.sci.gov.in",
     "Human Rights Commission: https://nhrc.nic.in",
-    "RTI Portal: https://rtionline.gov.in"
+    "RTI Portal: https://rtionline.gov.in",
   ],
   property: [
     "RERA Authority: https://rera.gov.in",
-    "Land Records: https://dilrmp.gov.in"
+    "Land Records: https://dilrmp.gov.in",
   ],
   labor: [
     "EPFO: https://www.epfindia.gov.in",
     "ESIC: https://www.esic.nic.in",
-    "Shram Suvidha: https://shramsuvidha.gov.in"
+    "Shram Suvidha: https://shramsuvidha.gov.in",
   ],
   tax: [
     "Income Tax: https://www.incometaxindia.gov.in",
-    "GST Portal: https://www.gst.gov.in"
+    "GST Portal: https://www.gst.gov.in",
   ],
   consumer: [
     "Consumer Helpline: 1800-11-4000",
-    "CONFONET: https://confonet.nic.in"
+    "CONFONET: https://confonet.nic.in",
   ],
   motor_vehicle: [
     "Parivahan Sewa: https://parivahan.gov.in",
-    "IRDA: https://www.irdai.gov.in"
+    "IRDA: https://www.irdai.gov.in",
   ],
   banking: [
     "Banking Ombudsman: https://bankingombudsman.rbi.org.in",
-    "RBI Grievance: https://cms.rbi.org.in"
+    "RBI Grievance: https://cms.rbi.org.in",
   ],
   general: [
     "NALSA: https://nalsa.gov.in",
     "E-Courts: https://ecourts.gov.in",
-    "Tele-Law: 1516"
-  ]
+    "Tele-Law: 1516",
+  ],
 };
 
 const RESPONSE_TEMPLATES = {
   greeting: {
-    formal: "Namaste! I'm Juris, your legal assistant for Indian law. How may I be of service?",
-    casual: "Hi! I'm Juris, here to help with Indian law questions. What's on your mind?",
-    neutral: "Namaste! I'm Juris. How can I help you with your legal query today?"
+    formal:
+      "Namaste! I'm Juris, your legal assistant for Indian law. How may I be of service?",
+    casual:
+      "Hi! I'm Juris, here to help with Indian law questions. What's on your mind?",
+    neutral:
+      "Namaste! I'm Juris. How can I help you with your legal query today?",
   },
   about: {
     short: "I'm Juris, an AI legal assistant for Indian law.",
-    neutral: "I'm Juris, an AI assistant specialized in Indian law. I can help answer legal questions, explain procedures, and guide you to appropriate resources."
+    neutral:
+      "I'm Juris, an AI assistant specialized in Indian law. I can help answer legal questions, explain procedures, and guide you to appropriate resources.",
   },
   capabilities: {
-    neutral: "I can help with:\n- Indian laws and procedures\n- Legal term explanations\n- Relevant resources\n- Document understanding\n- Emergency services\n\nWhat can I help you with?"
+    neutral:
+      "I can help with:\n- Indian laws and procedures\n- Legal term explanations\n- Relevant resources\n- Document understanding\n- Emergency services\n\nWhat can I help you with?",
   },
   thanks: {
-    neutral: "You're welcome! Feel free to ask if you have other legal questions."
-  }
+    neutral:
+      "You're welcome! Feel free to ask if you have other legal questions.",
+  },
 };
 
 const LEGAL_TERMS = {
   "ab initio": "from the beginning",
-  "affidavit": "written statement under oath",
-  "decree": "court order",
+  affidavit: "written statement under oath",
+  decree: "court order",
   "habeas corpus": "court order to present a detained person",
-  "injunction": "court order to stop something",
-  "mandamus": "court order to perform a duty",
-  "suo motu": "on its own motion"
+  injunction: "court order to stop something",
+  mandamus: "court order to perform a duty",
+  "suo motu": "on its own motion",
 };
 
 class AdvancedCache {
-  constructor(maxSize = 100, ttl = 3600000, name = 'cache') {
+  constructor(maxSize = 100, ttl = 3600000, name = "cache") {
     this.cache = new Map();
     this.maxSize = maxSize;
     this.ttl = ttl;
@@ -166,7 +366,7 @@ class AdvancedCache {
       hits: 0,
       misses: 0,
       evictions: 0,
-      errors: 0
+      errors: 0,
     };
     this.accessOrder = [];
     this.priorityKeys = new Set();
@@ -183,7 +383,7 @@ class AdvancedCache {
         value,
         timestamp: Date.now(),
         accessCount: 0,
-        isPriority
+        isPriority,
       });
 
       if (isPriority) this.priorityKeys.add(key);
@@ -264,7 +464,7 @@ class AdvancedCache {
       size: this.cache.size,
       maxSize: this.maxSize,
       hitRate: total > 0 ? ((this.stats.hits / total) * 100).toFixed(2) : 0,
-      ...this.stats
+      ...this.stats,
     };
   }
 
@@ -288,7 +488,7 @@ class Semaphore {
       this.count++;
       return;
     }
-    return new Promise(resolve => this.waiters.push(resolve));
+    return new Promise((resolve) => this.waiters.push(resolve));
   }
 
   release() {
@@ -301,9 +501,21 @@ class Semaphore {
 }
 
 const caches = {
-  classification: new AdvancedCache(CONFIG.CACHE.MAX_SIZE, CONFIG.CACHE.TTL, 'classification'),
-  response: new AdvancedCache(CONFIG.CACHE.MAX_SIZE * 2, CONFIG.CACHE.TTL, 'response'),
-  dynamic: new AdvancedCache(CONFIG.CACHE.MAX_SIZE, CONFIG.CACHE.TTL, 'dynamic')
+  classification: new AdvancedCache(
+    CONFIG.CACHE.MAX_SIZE,
+    CONFIG.CACHE.TTL,
+    "classification"
+  ),
+  response: new AdvancedCache(
+    CONFIG.CACHE.MAX_SIZE * 2,
+    CONFIG.CACHE.TTL,
+    "response"
+  ),
+  dynamic: new AdvancedCache(
+    CONFIG.CACHE.MAX_SIZE,
+    CONFIG.CACHE.TTL,
+    "dynamic"
+  ),
 };
 
 const metrics = {
@@ -314,21 +526,21 @@ const metrics = {
   successfulRetries: 0,
   totalResponseTime: 0,
   responseTimes: [],
-  startTime: Date.now()
+  startTime: Date.now(),
 };
 
 const health = {
   api: {
     isAvailable: true,
     lastCheck: Date.now(),
-    consecutiveFailures: 0
+    consecutiveFailures: 0,
   },
   connection: {
     lastSuccessful: Date.now(),
     consecutiveErrors: 0,
     isStable: true,
-    errorTypes: {}
-  }
+    errorTypes: {},
+  },
 };
 
 const semaphore = new Semaphore(CONFIG.REQUEST.MAX_CONCURRENT);
@@ -337,7 +549,7 @@ const Utils = {
   normalizeQuery: (query) => query.toLowerCase().trim(),
 
   analyzeQuery: (query) => {
-    const words = query.split(/\s+/).filter(w => w.length > 0);
+    const words = query.split(/\s+/).filter((w) => w.length > 0);
     return {
       length: query.length,
       wordCount: words.length,
@@ -346,7 +558,7 @@ const Utils = {
       isLong: words.length > 15,
       startsWithGreeting: REGEX.GREETING.test(query),
       containsPlease: /please/i.test(query),
-      hasAllCaps: /[A-Z]{3,}/.test(query)
+      hasAllCaps: /[A-Z]{3,}/.test(query),
     };
   },
 
@@ -377,22 +589,28 @@ const Utils = {
 
   simplifyLegalTerms: (text) => {
     const termsPattern = Object.keys(LEGAL_TERMS)
-      .map(k => k.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\\$&`))
-      .join('|');
-    const pattern = new RegExp(String.raw`\b(${termsPattern})\b`, 'gi');
+      .map((k) => k.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\\$&`))
+      .join("|");
+    const pattern = new RegExp(String.raw`\b(${termsPattern})\b`, "gi");
     return text.replace(pattern, (match) => {
       const term = LEGAL_TERMS[match.toLowerCase()];
       return `${match} (${term})`;
     });
   },
 
-  formatResponse: (text, category, sentiment = "neutral", hasRealtimeData = false) => {
+  formatResponse: (
+    text,
+    category,
+    sentiment = "neutral",
+    hasRealtimeData = false
+  ) => {
     let formatted = text.trim();
 
     const sentimentPrefixes = {
-      frustrated: "I understand this can be frustrating. Let me help clarify.\n\n",
+      frustrated:
+        "I understand this can be frustrating. Let me help clarify.\n\n",
       urgent: "I recognize the urgency. Here's what you need to know:\n\n",
-      confused: "Let me break this down in simpler terms:\n\n"
+      confused: "Let me break this down in simpler terms:\n\n",
     };
 
     if (sentimentPrefixes[sentiment]) {
@@ -400,18 +618,24 @@ const Utils = {
     }
 
     if (!hasRealtimeData) {
-      formatted += "\n\n**Note**: This is general legal information. For advice specific to your situation, please consult a qualified lawyer.";
+      formatted +=
+        "\n\n**Note**: This is general legal information. For advice specific to your situation, please consult a qualified lawyer.";
     }
 
     if (!hasRealtimeData && category !== "general") {
       const resources = LEGAL_RESOURCES[category] || LEGAL_RESOURCES.general;
       if (resources.length > 0) {
-        formatted += "\n\n**Related Resources**:\n" + resources.slice(0, 3).map(r => `• ${r}`).join("\n");
+        formatted +=
+          "\n\n**Related Resources**:\n" +
+          resources
+            .slice(0, 3)
+            .map((r) => `• ${r}`)
+            .join("\n");
       }
     }
 
     return formatted;
-  }
+  },
 };
 
 const Classifier = {
@@ -429,13 +653,17 @@ const Classifier = {
       requestType: "information",
       sentiment: Utils.detectSentiment(query),
       containsIndianLanguage: REGEX.INDIAN_LANGUAGE.test(query),
-      isEmergency: Utils.matchKeywords(query, KEYWORDS.emergency) > 0
+      isEmergency: Utils.matchKeywords(query, KEYWORDS.emergency) > 0,
     };
 
     if (result.isLegal) {
       result.subCategory = Classifier.categorize(query);
       const q = query.toLowerCase();
-      if (q.includes("how to") || q.includes("process") || q.includes("procedure")) {
+      if (
+        q.includes("how to") ||
+        q.includes("process") ||
+        q.includes("procedure")
+      ) {
         result.requestType = "procedural";
       } else if (q.includes("help") || q.includes("advice")) {
         result.requestType = "advice";
@@ -487,27 +715,33 @@ Format:
 
     try {
       metrics.aiCalls++;
-      const result = await RetryHandler.execute(() => model.generateContent(prompt), 2);
+      const result = await RetryHandler.execute(
+        () => model.generateContent(prompt),
+        2
+      );
 
-      let text = result.response?.text?.() ||
+      let text =
+        result.response?.text?.() ||
         result.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
         result.text?.();
 
-      text = text.trim().replaceAll(/```json\n?|\n?```/g, '');
+      text = text.trim().replaceAll(/```json\n?|\n?```/g, "");
 
-      if (text.startsWith('{') && text.endsWith('}')) {
+      if (text.startsWith("{") && text.endsWith("}")) {
         const classification = JSON.parse(text);
         const complete = {
           isLegal: classification.isLegal || false,
           confidence: classification.confidence || 0,
           category: classification.category || "non_legal",
-          subCategory: classification.isLegal ? (classification.subCategory || "general") : null,
+          subCategory: classification.isLegal
+            ? classification.subCategory || "general"
+            : null,
           requestType: classification.requestType || "information",
           sentiment: classification.sentiment || "neutral",
           complexity: classification.complexity || 1,
           specificLaws: classification.specificLaws || [],
           containsIndianLanguage: REGEX.INDIAN_LANGUAGE.test(query),
-          isEmergency: Utils.matchKeywords(query, KEYWORDS.emergency) > 0
+          isEmergency: Utils.matchKeywords(query, KEYWORDS.emergency) > 0,
         };
 
         return caches.dynamic.set(cacheKey, complete);
@@ -518,7 +752,7 @@ Format:
     }
 
     return Classifier.basic(query);
-  }
+  },
 };
 
 const RetryHandler = {
@@ -533,7 +767,10 @@ const RetryHandler = {
         try {
           const timeout = CONFIG.REQUEST.TIMEOUT * (1 + (attempt - 1) * 0.5);
           const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`Timeout after ${timeout}ms`)), timeout)
+            setTimeout(
+              () => reject(new Error(`Timeout after ${timeout}ms`)),
+              timeout
+            )
           );
 
           const result = await Promise.race([fn(), timeoutPromise]);
@@ -544,13 +781,13 @@ const RetryHandler = {
           lastError = error;
           metrics.retries++;
 
-          if (error.message.includes('Timeout')) {
+          if (error.message.includes("Timeout")) {
             metrics.timeouts++;
           }
 
           if (attempt < maxRetries) {
             const delay = CONFIG.REQUEST.RETRY_DELAY * Math.pow(2, attempt - 1);
-            await new Promise(resolve => setTimeout(resolve, delay));
+            await new Promise((resolve) => setTimeout(resolve, delay));
             attempt++;
           } else {
             break;
@@ -562,7 +799,7 @@ const RetryHandler = {
     }
 
     throw lastError;
-  }
+  },
 };
 
 const ResponseGenerator = {
@@ -571,7 +808,9 @@ const ResponseGenerator = {
     const analysis = Utils.analyzeQuery(query);
 
     if (REGEX.GREETING.test(q)) {
-      return analysis.isShort ? RESPONSE_TEMPLATES.greeting.casual : RESPONSE_TEMPLATES.greeting.neutral;
+      return analysis.isShort
+        ? RESPONSE_TEMPLATES.greeting.casual
+        : RESPONSE_TEMPLATES.greeting.neutral;
     }
     if (REGEX.ABOUT.test(q)) {
       return RESPONSE_TEMPLATES.about.neutral;
@@ -609,12 +848,17 @@ const ResponseGenerator = {
     metrics.aiCalls++;
     const startTime = Date.now();
 
-    const isRecentQuery = /202[4-9]|latest|recent|current|new|update/i.test(prompt);
-    const isSpecificTopicQuery = /about|regarding|concerning|explain|what is|tell me about/i.test(prompt);
+    const isRecentQuery = /202[4-9]|latest|recent|current|new|update/i.test(
+      prompt
+    );
+    const isSpecificTopicQuery =
+      /about|regarding|concerning|explain|what is|tell me about/i.test(prompt);
 
     const buildMainPrompt = () => {
       const systemPrompt = `[SYSTEM: You are Juris, an expert legal assistant for Indian law. Provide accurate, clear information. Cite specific laws when relevant. Avoid jargon and explain complex terms. Structure answers clearly. When discussing recent developments, seamlessly integrate real-time information without mentioning knowledge cutoff dates. Present all information as current and authoritative.]\n\n`;
-      const contextPrompt = `[CONTEXT: ${classification.subCategory || 'general'} law, ${classification.sentiment} sentiment, ${classification.requestType} request, complexity ${classification.complexity || 1}/5]\n\n`;
+      const contextPrompt = `[CONTEXT: ${classification.subCategory || "general"
+        } law, ${classification.sentiment} sentiment, ${classification.requestType
+        } request, complexity ${classification.complexity || 1}/5]\n\n`;
 
       let main = systemPrompt + contextPrompt;
       if (isRecentQuery) {
@@ -631,22 +875,27 @@ const ResponseGenerator = {
       if (!classification.isLegal) return null;
 
       if (isRecentQuery) {
-        return await getRecentLegalUpdates(classification.subCategory || 'general', {
-          deepSearch: true,
-          useCustomEngine: true
-        });
+        return await getRecentLegalUpdates(
+          classification.subCategory || "general",
+          {
+            deepSearch: true,
+            useCustomEngine: true,
+          }
+        );
       }
 
       if (isSpecificTopicQuery) {
-        const topicMatch = prompt.match(/(?:about|regarding|concerning|explain|what is|tell me about)\s+(.+?)(?:\?|$)/i);
+        const topicMatch = prompt.match(
+          /(?:about|regarding|concerning|explain|what is|tell me about)\s+(.+?)(?:\?|$)/i
+        );
         if (!topicMatch) return null;
         const topic = topicMatch[1].trim();
         const results = await searchSpecificTopic(topic, {
           deepSearch: true,
           includeRelated: true,
-          useCustomEngine: true
+          useCustomEngine: true,
         });
-        if (results && typeof results === 'object' && results.main) {
+        if (results && typeof results === "object" && results.main) {
           return [...results.main, ...(results.related || [])];
         }
         return results;
@@ -665,15 +914,15 @@ const ResponseGenerator = {
         /Therefore.*?real-time updates.*?\.\s*/gi,
         /Accessing that information would require.*?\.\s*/gi,
         /To get (?:the )?information you need.*?\.\s*/gi,
-        /I recommend the following:.*?(?=\n\n|\*\*|$)/gis
+        /I recommend the following:.*?(?=\n\n|\*\*|$)/gis,
       ];
 
       let p = text;
-      for (const pat of patterns) p = p.replaceAll(pat, '');
-      p += '\n\n**Additional Resources from Recent Developments:**\n';
+      for (const pat of patterns) p = p.replaceAll(pat, "");
+      p += "\n\n**Additional Resources from Recent Developments:**\n";
       p += formatSearchResults(realtimeResults, {
         maxResults: 5,
-        showStats: false
+        showStats: false,
       });
       return p;
     };
@@ -682,8 +931,12 @@ const ResponseGenerator = {
       const mainPrompt = buildMainPrompt();
       const realtimeResults = await fetchRealtimeResults();
 
-      const result = await RetryHandler.execute(() => model.generateContent(mainPrompt), 2);
-      let text = result.response?.text?.() ||
+      const result = await RetryHandler.execute(
+        () => model.generateContent(mainPrompt),
+        2
+      );
+      let text =
+        result.response?.text?.() ||
         result.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
         result.text?.();
 
@@ -692,9 +945,10 @@ const ResponseGenerator = {
       metrics.responseTimes.push(responseTime);
       if (metrics.responseTimes.length > 100) metrics.responseTimes.shift();
 
-      let processed = (classification.isEmergency || (classification.complexity || 1) >= 4)
-        ? Utils.simplifyLegalTerms(text)
-        : text;
+      let processed =
+        classification.isEmergency || (classification.complexity || 1) >= 4
+          ? Utils.simplifyLegalTerms(text)
+          : text;
 
       processed = cleanProcessedWithRealtime(processed, realtimeResults);
 
@@ -712,13 +966,16 @@ const ResponseGenerator = {
       metrics.aiErrors++;
       return "I'm experiencing difficulty answering your legal question. Please try rephrasing or ask about a specific aspect.";
     }
-  }
+  },
 };
 
 const HealthMonitor = {
   async checkAPI() {
     const now = Date.now();
-    if (!health.api.isAvailable && (now - health.api.lastCheck) < CONFIG.HEALTH.CHECK_INTERVAL) {
+    if (
+      !health.api.isAvailable &&
+      now - health.api.lastCheck < CONFIG.HEALTH.CHECK_INTERVAL
+    ) {
       return false;
     }
 
@@ -732,16 +989,19 @@ const HealthMonitor = {
       health.api.isAvailable = false;
       health.api.consecutiveFailures++;
       health.api.lastCheck = now;
-      console.error(`API unavailable (failure #${health.api.consecutiveFailures})`, error);
+      console.error(
+        `API unavailable (failure #${health.api.consecutiveFailures})`,
+        error
+      );
       return false;
     }
   },
 
   async checkConnection() {
     try {
-      await fetch('https://generativelanguage.googleapis.com/v1/models', {
-        method: 'GET',
-        signal: AbortSignal.timeout(5000)
+      await fetch("https://generativelanguage.googleapis.com/v1/models", {
+        method: "GET",
+        signal: AbortSignal.timeout(5000),
       });
 
       health.connection.lastSuccessful = Date.now();
@@ -750,15 +1010,19 @@ const HealthMonitor = {
       return true;
     } catch (error) {
       health.connection.consecutiveErrors++;
-      const errorType = error.code || 'UNKNOWN';
-      health.connection.errorTypes[errorType] = (health.connection.errorTypes[errorType] || 0) + 1;
+      const errorType = error.code || "UNKNOWN";
+      health.connection.errorTypes[errorType] =
+        (health.connection.errorTypes[errorType] || 0) + 1;
 
-      if (health.connection.consecutiveErrors >= CONFIG.HEALTH.MAX_CONSECUTIVE_ERRORS) {
+      if (
+        health.connection.consecutiveErrors >=
+        CONFIG.HEALTH.MAX_CONSECUTIVE_ERRORS
+      ) {
         health.connection.isStable = false;
       }
       return false;
     }
-  }
+  },
 };
 
 async function processQuery(query) {
@@ -771,23 +1035,33 @@ async function processQuery(query) {
       return {
         response: cachedResponse,
         classification: cachedClassification,
-        fromCache: true
+        fromCache: true,
       };
     }
 
     const basicClassification = Classifier.basic(query);
 
     if (!health.connection.isStable || !health.api.isAvailable) {
-      if (basicClassification.category === "general_chat" || !basicClassification.isLegal) {
+      if (
+        basicClassification.category === "general_chat" ||
+        !basicClassification.isLegal
+      ) {
         return {
-          response: ResponseGenerator[basicClassification.category]?.(query) || ResponseGenerator.chat(query),
+          response:
+            ResponseGenerator[basicClassification.category]?.(query) ||
+            ResponseGenerator.chat(query),
           classification: basicClassification,
-          fromCache: true
+          fromCache: true,
         };
       }
       return {
-        response: "Our AI service is temporarily unavailable. Please try again shortly.",
-        classification: { isLegal: false, category: "service_unavailable", confidence: 1 }
+        response:
+          "Our AI service is temporarily unavailable. Please try again shortly.",
+        classification: {
+          isLegal: false,
+          category: "service_unavailable",
+          confidence: 1,
+        },
       };
     }
 
@@ -812,9 +1086,10 @@ async function processQuery(query) {
   } catch (error) {
     console.error("Error processing query:", error);
     return {
-      response: "I apologize, but I'm having trouble processing your request. Please try again.",
+      response:
+        "I apologize, but I'm having trouble processing your request. Please try again.",
       classification: { isLegal: false, category: "error", confidence: 0 },
-      error: error.message
+      error: error.message,
     };
   }
 }
@@ -822,28 +1097,40 @@ async function processQuery(query) {
 async function generateChatTitle(query, classification) {
   if (classification.isLegal) {
     const categoryTitles = {
-      criminal: 'Criminal Law',
-      civil: 'Civil Matter',
-      family: 'Family Law',
-      constitutional: 'Constitutional Issue',
-      property: 'Property Matter',
-      labor: 'Employment Issue',
-      tax: 'Tax Query',
-      consumer: 'Consumer Rights',
-      motor_vehicle: 'Vehicle Matter',
-      banking: 'Banking Issue'
+      criminal: "Criminal Law",
+      civil: "Civil Matter",
+      family: "Family Law",
+      constitutional: "Constitutional Issue",
+      property: "Property Matter",
+      labor: "Employment Issue",
+      tax: "Tax Query",
+      consumer: "Consumer Rights",
+      motor_vehicle: "Vehicle Matter",
+      banking: "Banking Issue",
     };
 
-    const categoryLabel = categoryTitles[classification.subCategory] || 'Legal Query';
+    const categoryLabel =
+      categoryTitles[classification.subCategory] || "Legal Query";
 
-    const legalTerms = ['IPC', 'CrPC', 'CPC', 'GST', 'RERA', 'FIR', 'PIL', 'RTI'];
-    const foundTerm = legalTerms.find(term => query.toUpperCase().includes(term));
+    const legalTerms = [
+      "IPC",
+      "CrPC",
+      "CPC",
+      "GST",
+      "RERA",
+      "FIR",
+      "PIL",
+      "RTI",
+    ];
+    const foundTerm = legalTerms.find((term) =>
+      query.toUpperCase().includes(term)
+    );
 
     if (foundTerm) {
       return `${categoryLabel}: ${foundTerm}`;
     }
 
-    const words = query.trim().split(/\s+/).slice(0, 6).join(' ');
+    const words = query.trim().split(/\s+/).slice(0, 6).join(" ");
     if (words.length <= 50) {
       return words;
     }
@@ -855,15 +1142,15 @@ async function generateChatTitle(query, classification) {
     return query;
   }
 
-  return query.substring(0, 47) + '...';
+  return query.substring(0, 47) + "...";
 }
 
 async function batchProcessQueries(queries) {
   if (!queries?.length) return [];
 
-  const prioritized = queries.map(query => ({
+  const prioritized = queries.map((query) => ({
     query,
-    priority: determinePriority(query)
+    priority: determinePriority(query),
   }));
 
   prioritized.sort((a, b) => {
@@ -875,22 +1162,28 @@ async function batchProcessQueries(queries) {
   let currentBatch = [];
 
   for (const { query, priority } of prioritized) {
-    if (priority === 'high' && currentBatch.length > 0) {
-      results.push(...await Promise.all(currentBatch.map(q => processQuery(q))));
+    if (priority === "high" && currentBatch.length > 0) {
+      results.push(
+        ...(await Promise.all(currentBatch.map((q) => processQuery(q))))
+      );
       currentBatch = [];
     }
 
     currentBatch.push(query);
-    const limit = priority === 'high' ? 2 : CONFIG.REQUEST.BATCH_SIZE;
+    const limit = priority === "high" ? 2 : CONFIG.REQUEST.BATCH_SIZE;
 
     if (currentBatch.length >= limit) {
-      results.push(...await Promise.all(currentBatch.map(q => processQuery(q))));
+      results.push(
+        ...(await Promise.all(currentBatch.map((q) => processQuery(q))))
+      );
       currentBatch = [];
     }
   }
 
   if (currentBatch.length > 0) {
-    results.push(...await Promise.all(currentBatch.map(q => processQuery(q))));
+    results.push(
+      ...(await Promise.all(currentBatch.map((q) => processQuery(q))))
+    );
   }
 
   return results;
@@ -898,19 +1191,19 @@ async function batchProcessQueries(queries) {
 
 function determinePriority(query) {
   if (Utils.matchKeywords(query, KEYWORDS.emergency) > 0) {
-    return 'high';
+    return "high";
   }
 
   const q = query.toLowerCase();
   if (/deadline|urgent|tomorrow|today|immediately|asap/.test(q)) {
-    return 'high';
+    return "high";
   }
 
   if (query.length < 50 || /how (do|can)|what (is|are)/.test(q)) {
-    return 'medium';
+    return "medium";
   }
 
-  return 'normal';
+  return "normal";
 }
 
 function getServiceMetrics() {
@@ -921,14 +1214,14 @@ function getServiceMetrics() {
   if (metrics.responseTimes.length > 0) {
     const sorted = [...metrics.responseTimes].sort((a, b) => a - b);
     const mid = Math.floor(sorted.length / 2);
-    medianResponseTime = sorted.length % 2 === 0
-      ? (sorted[mid - 1] + sorted[mid]) / 2
-      : sorted[mid];
+    medianResponseTime =
+      sorted.length % 2 === 0
+        ? (sorted[mid - 1] + sorted[mid]) / 2
+        : sorted[mid];
   }
 
-  const avgResponseTime = metrics.aiCalls > 0
-    ? metrics.totalResponseTime / metrics.aiCalls
-    : 0;
+  const avgResponseTime =
+    metrics.aiCalls > 0 ? metrics.totalResponseTime / metrics.aiCalls : 0;
 
   return {
     performance: {
@@ -939,65 +1232,112 @@ function getServiceMetrics() {
       successfulRetries: metrics.successfulRetries,
       avgResponseTime: avgResponseTime.toFixed(2),
       medianResponseTime: medianResponseTime.toFixed(2),
-      uptime
+      uptime,
     },
     caches: {
       classification: caches.classification.getStats(),
       response: caches.response.getStats(),
-      dynamic: caches.dynamic.getStats()
+      dynamic: caches.dynamic.getStats(),
     },
     health: {
       api: {
         available: health.api.isAvailable,
         lastCheck: health.api.lastCheck,
-        consecutiveFailures: health.api.consecutiveFailures
+        consecutiveFailures: health.api.consecutiveFailures,
       },
       connection: {
         ...health.connection,
-        timeSinceLastSuccess: now - health.connection.lastSuccessful
-      }
+        timeSinceLastSuccess: now - health.connection.lastSuccessful,
+      },
     },
     system: {
       memory: process.memoryUsage(),
-      cpuUsage: process.cpuUsage()
-    }
+      cpuUsage: process.cpuUsage(),
+    },
   };
 }
 
-module.exports = {
-  processQuery,
-  generateChatTitle,
-  batchProcessQueries,
-  isLegalQuery: (query) => Classifier.basic(query).isLegal,
-  classifyQuery: Classifier.basic,
-  classifyQueryDynamic: Classifier.withAI,
-  categorizeIndianLegalQuery: Classifier.categorize,
-  generateGeminiResponse: ResponseGenerator.legal,
-  handleNonLegalQuery: (query, classification) => {
-    const handler = ResponseGenerator[classification.category];
-    return handler ? handler(query) : ResponseGenerator.chat(query);
-  },
-  generateIndianLegalResources: (category) => LEGAL_RESOURCES[category] || LEGAL_RESOURCES.general,
-  formatIndianLegalResponse: Utils.formatResponse,
-  containsIndianLanguage: (query) => REGEX.INDIAN_LANGUAGE.test(query),
-  simplifyLegalTerms: Utils.simplifyLegalTerms,
-  isEmergencyLegalQuery: (query) => Utils.matchKeywords(query, KEYWORDS.emergency) > 0,
-  getEmergencyLegalResources: () => ({
+function isLegalQuery(query) {
+  return Classifier.basic(query).isLegal;
+}
+
+const classifyQuery = Classifier.basic;
+const classifyQueryDynamic = Classifier.withAI;
+const categorizeIndianLegalQuery = Classifier.categorize;
+const generateGeminiResponse = ResponseGenerator.legal;
+
+function handleNonLegalQuery(query, classification) {
+  const handler = ResponseGenerator[classification.category];
+  return handler ? handler(query) : ResponseGenerator.chat(query);
+}
+
+function generateIndianLegalResources(category) {
+  return LEGAL_RESOURCES[category] || LEGAL_RESOURCES.general;
+}
+
+const formatIndianLegalResponse = Utils.formatResponse;
+
+function containsIndianLanguage(query) {
+  return REGEX.INDIAN_LANGUAGE.test(query);
+}
+
+const simplifyLegalTerms = Utils.simplifyLegalTerms;
+
+function isEmergencyLegalQuery(query) {
+  return Utils.matchKeywords(query, KEYWORDS.emergency) > 0;
+}
+
+function getEmergencyLegalResources() {
+  return {
     police: "100",
     women_helpline: "1091",
     child_helpline: "1098",
     senior_citizen_helpline: "14567",
     nalsa: "1516",
-    domestic_violence: "181"
-  }),
-  checkGeminiApiStatus: HealthMonitor.checkAPI,
-  checkConnectionHealth: HealthMonitor.checkConnection,
+    domestic_violence: "181",
+  };
+}
+
+const checkGeminiApiStatus = HealthMonitor.checkAPI;
+const checkConnectionHealth = HealthMonitor.checkConnection;
+
+function getUnavailableServiceResponse() {
+  return {
+    response:
+      "Our AI service is temporarily unavailable. We're working to restore service. Please try again later.",
+    classification: {
+      isLegal: false,
+      category: "service_unavailable",
+      confidence: 1,
+    },
+  };
+}
+
+const withRetry = RetryHandler.execute;
+const prioritizeQuery = determinePriority;
+const adjustThrottling = () => { };
+
+export {
+  processQuery,
+  generateChatTitle,
+  batchProcessQueries,
+  isLegalQuery,
+  classifyQuery,
+  classifyQueryDynamic,
+  categorizeIndianLegalQuery,
+  generateGeminiResponse,
+  handleNonLegalQuery,
+  generateIndianLegalResources,
+  formatIndianLegalResponse,
+  containsIndianLanguage,
+  simplifyLegalTerms,
+  isEmergencyLegalQuery,
+  getEmergencyLegalResources,
+  checkGeminiApiStatus,
+  checkConnectionHealth,
   getServiceMetrics,
-  getUnavailableServiceResponse: () => ({
-    response: "Our AI service is temporarily unavailable. We're working to restore service. Please try again later.",
-    classification: { isLegal: false, category: "service_unavailable", confidence: 1 }
-  }),
-  withRetry: RetryHandler.execute,
-  prioritizeQuery: determinePriority,
-  adjustThrottling: () => { }
+  getUnavailableServiceResponse,
+  withRetry,
+  prioritizeQuery,
+  adjustThrottling,
 };
