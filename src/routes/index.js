@@ -1,13 +1,14 @@
-const express = require("express");
+import express from "express";
+import authRoutes from "./authRoutes.js";
+import chatRoutes from "./chatRoutes.js";
+import feedbackRoutes from "./feedbackRoutes.js";
+import healthCheckRoutes from "./healthCheck.js";
+
 const router = express.Router();
-const authRoutes = require("./authRoutes");
-const chatRoutes = require("./chatRoutes");
-const feedbackRoutes = require("./feedbackRoutes");
-const healthCheckRoutes = require("./healthCheck");
 
 router.use("/", authRoutes);
 router.use("/chat", chatRoutes);
 router.use("/feedback", feedbackRoutes);
 router.use("/health", healthCheckRoutes);
 
-module.exports = router;
+export default router;
