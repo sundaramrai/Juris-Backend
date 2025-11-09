@@ -1,44 +1,44 @@
-const mongoose = require("mongoose");
+import mongoose from "mongoose";
 
 const chatSchema = new mongoose.Schema({
   userId: {
     type: String,
-    required: true
+    required: true,
   },
   chatId: {
     type: String,
     required: true,
-    unique: true
+    unique: true,
   },
   title: {
     type: String,
-    default: "New Chat"
+    default: "New Chat",
   },
   messages: [
     {
       type: {
         type: String,
         enum: ["user", "bot"],
-        required: true
+        required: true,
       },
       text: {
         type: String,
-        required: true
+        required: true,
       },
       time: {
         type: Date,
-        default: Date.now
-      }
-    }
+        default: Date.now,
+      },
+    },
   ],
   createdAt: {
     type: Date,
-    default: Date.now
+    default: Date.now,
   },
   updatedAt: {
     type: Date,
-    default: Date.now
-  }
+    default: Date.now,
+  },
 });
 
 chatSchema.pre("save", function (next) {
@@ -46,4 +46,4 @@ chatSchema.pre("save", function (next) {
   next();
 });
 
-module.exports = mongoose.model("Chat", chatSchema);
+export default mongoose.model("Chat", chatSchema);
