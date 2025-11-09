@@ -9,12 +9,12 @@ class LockManager {
             timeoutCount: 0,
             avgWaitTime: 0,
             totalWaitTime: 0,
-            waitCount: 0
+            waitCount: 0,
         };
     }
 
     async acquireLock(documentId, timeoutMs = this.lockTimeout) {
-        if (!documentId) throw new Error('Document ID is required');
+        if (!documentId) throw new Error("Document ID is required");
 
         const startTime = Date.now();
         if (this.locks.has(documentId)) {
@@ -39,8 +39,12 @@ class LockManager {
                             }
                         }
                         this.metrics.timeoutCount++;
-                        reject(new Error(`Lock acquisition timed out after ${timeoutMs}ms for document ${documentId}`));
-                    }, timeoutMs)
+                        reject(
+                            new Error(
+                                `Lock acquisition timed out after ${timeoutMs}ms for document ${documentId}`
+                            )
+                        );
+                    }, timeoutMs),
                 };
 
                 this.waitingQueue.get(documentId).push(waitInfo);
@@ -50,12 +54,13 @@ class LockManager {
             const waitTime = Date.now() - startTime;
             this.metrics.totalWaitTime += waitTime;
             this.metrics.waitCount++;
-            this.metrics.avgWaitTime = this.metrics.totalWaitTime / this.metrics.waitCount;
+            this.metrics.avgWaitTime =
+                this.metrics.totalWaitTime / this.metrics.waitCount;
         }
 
         this.locks.set(documentId, {
             timestamp: Date.now(),
-            owner: Math.random().toString(36).substring(2, 15)
+            owner: Math.random().toString(36).substring(2, 15),
         });
         this.metrics.acquiredCount++;
 
@@ -104,10 +109,13 @@ class LockManager {
             ...this.metrics,
             activeLocks: this.locks.size,
             waitingQueues: this.waitingQueue.size,
-            waitingProcesses: Array.from(this.waitingQueue.values()).reduce((sum, queue) => sum + queue.length, 0)
+            waitingProcesses: Array.from(this.waitingQueue.values()).reduce(
+                (sum, queue) => sum + queue.length,
+                0
+            ),
         };
     }
 }
 
 const lockManager = new LockManager();
-module.exports = lockManager;
+export default lockManager;
