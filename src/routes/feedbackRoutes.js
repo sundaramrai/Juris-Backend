@@ -1,9 +1,10 @@
-const express = require("express");
+import express from "express";
+import * as feedbackController from "../controllers/feedbackController.js";
+import { authenticateToken } from "../middleware/auth.js";
+
 const router = express.Router();
-const feedbackController = require("../controllers/feedbackController");
-const { authenticateToken } = require("../middleware/auth");
 
 router.post("/", authenticateToken, feedbackController.submitFeedback);
 router.get("/", authenticateToken, feedbackController.getFeedback);
 
-module.exports = router;
+export default router;
