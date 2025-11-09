@@ -1,7 +1,7 @@
-const Feedback = require("../models/Feedback");
-const { encryptText, decryptText } = require("../utils/encryption");
+import Feedback from "../models/Feedback.js";
+import { encryptText, decryptText } from "../utils/encryption.js";
 
-exports.submitFeedback = async (req, res) => {
+export async function submitFeedback(req, res) {
   try {
     const { improvements, issues, satisfaction } = req.body;
     const userId = req.user.userId;
@@ -9,7 +9,9 @@ exports.submitFeedback = async (req, res) => {
       return res.status(400).json({ message: "All fields are required" });
     }
     if (satisfaction < 1 || satisfaction > 5) {
-      return res.status(400).json({ message: "Satisfaction must be between 1 and 5" });
+      return res
+        .status(400)
+        .json({ message: "Satisfaction must be between 1 and 5" });
     }
 
     const encryptedImprovements = encryptText(improvements);
@@ -22,32 +24,32 @@ exports.submitFeedback = async (req, res) => {
     feedback.feedback.push({
       satisfaction,
       issues: encryptedIssues,
-      improvements: encryptedImprovements
+      improvements: encryptedImprovements,
     });
     await feedback.save();
 
     res.status(201).json({ message: "Feedback submitted successfully" });
   } catch (error) {
-    console.error("❌ Error submitting feedback:", error);
+    console.error("Error submitting feedback:", error);
     res.status(500).json({ message: "Error submitting feedback" });
   }
-};
+}
 
-exports.getFeedback = async (req, res) => {
+export async function getFeedback(req, res) {
   try {
     const userId = req.user.userId;
     const feedback = await Feedback.findOne({ userId });
     if (!feedback) {
       return res.json({ feedback: [] });
     }
-    const decryptedFeedback = feedback.feedback.map(entry => ({
+    const decryptedFeedback = feedback.feedback.map((entry) => ({
       satisfaction: entry.satisfaction,
       issues: decryptText(entry.issues),
-      improvements: decryptText(entry.improvements)
+      improvements: decryptText(entry.improvements),
     }));
     res.json({ feedback: decryptedFeedback });
   } catch (error) {
-    console.error("❌ Error fetching feedback:", error);
+    console.error("Error fetching feedback:", error);
     res.status(500).json({ message: "Error fetching feedback" });
   }
-};
+}
