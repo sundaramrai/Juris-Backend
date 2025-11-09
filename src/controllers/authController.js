@@ -1,7 +1,7 @@
-const User = require("../models/User");
-const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
-const { encryptText, decryptText, hashUsername } = require("../utils/encryption");
+import User from "../models/User.js";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+import { encryptText, decryptText, hashUsername } from "../utils/encryption.js";
 
 function sendError(res, status, message, error = null) {
   const payload = { message };
@@ -13,7 +13,7 @@ async function findExistingUser(email, usernameHash) {
   return await User.findOne({ $or: [{ email }, { usernameHash }] });
 }
 
-exports.register = async (req, res) => {
+export async function register(req, res) {
   try {
     const { email, username, password } = req.body;
     const usernameHash = hashUsername(username);
@@ -21,9 +21,17 @@ exports.register = async (req, res) => {
     const existingUser = await findExistingUser(email, usernameHash);
     if (existingUser) {
       if (existingUser.email === email) {
-        return sendError(res, 400, "The email address you entered is already registered. Please use a different email.");
+        return sendError(
+          res,
+          400,
+          "The email address you entered is already registered. Please use a different email."
+        );
       }
-      return sendError(res, 400, "The username you entered is already taken. Please choose another username.");
+      return sendError(
+        res,
+        400,
+        "The username you entered is already taken. Please choose another username."
+      );
     }
 
     const encryptedEmail = encryptText(email);
@@ -38,14 +46,21 @@ exports.register = async (req, res) => {
     });
     await user.save();
 
-    res.status(201).json({ message: "Registration successful! You can now log in." });
+    res
+      .status(201)
+      .json({ message: "Registration successful! You can now log in." });
   } catch (error) {
-    console.error("❌ Registration Error:", error);
-    sendError(res, 500, "An unexpected server error occurred during registration. Please try again later.", error);
+    console.error("Registration Error:", error);
+    sendError(
+      res,
+      500,
+      "An unexpected server error occurred during registration. Please try again later.",
+      error
+    );
   }
-};
+}
 
-exports.login = async (req, res) => {
+export async function login(req, res) {
   try {
     const { username, password } = req.body;
     const usernameHash = hashUsername(username);
@@ -75,18 +90,29 @@ exports.login = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("❌ Login Error:", error);
-    sendError(res, 500, "An unexpected server error occurred during login. Please try again later.", error);
+    console.error("Login Error:", error);
+    sendError(
+      res,
+      500,
+      "An unexpected server error occurred during login. Please try again later.",
+      error
+    );
   }
-};
+}
 
-exports.getUser = async (req, res) => {
+export async function getUser(req, res) {
   try {
     const user = await User.findById(req.user.userId).select("-password");
-    if (!user) return sendError(res, 404, "User not found. Please log in again.");
+    if (!user)
+      return sendError(res, 404, "User not found. Please log in again.");
     res.json(user);
   } catch (error) {
-    console.error("❌ Error fetching user:", error);
-    sendError(res, 500, "An error occurred while fetching user details. Please try again later.", error);
+    console.error("Error fetching user:", error);
+    sendError(
+      res,
+      500,
+      "An error occurred while fetching user details. Please try again later.",
+      error
+    );
   }
-};
+}
