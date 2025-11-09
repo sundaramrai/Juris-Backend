@@ -1,8 +1,2 @@
-const rateLimiter = require('./rateLimiter');
-const { errorHandler, errorMiddleware } = require('./errorHandler');
-
-module.exports = {
-  rateLimiter,
-  errorHandler,
-  errorMiddleware
-};
+export { default as rateLimiter } from "./rateLimiter.js";
+export { errorHandler, errorMiddleware } from "./errorHandler.js";
