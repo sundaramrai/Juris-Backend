@@ -100,6 +100,30 @@ export async function login(req, res) {
   }
 }
 
+const tokenBlacklist = new Set();
+
+export async function logout(req, res) {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (token) {
+      tokenBlacklist.add(token);
+    }
+    res.json({ message: "Logout successful. Session terminated." });
+  } catch (error) {
+    console.error("Logout Error:", error);
+    sendError(
+      res,
+      500,
+      "An unexpected server error occurred during logout. Please try again later.",
+      error
+    );
+  }
+}
+
+export function isTokenBlacklisted(token) {
+  return tokenBlacklist.has(token);
+}
+
 export async function getUser(req, res) {
   try {
     const user = await User.findById(req.user.userId).select("-password");
