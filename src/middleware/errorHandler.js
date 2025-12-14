@@ -1,3 +1,5 @@
+import { appConfig } from "../config/app.js";
+
 class ErrorHandler {
     constructor() {
         this.errorLog = [];
@@ -78,3 +80,14 @@ const errorHandler = new ErrorHandler();
 
 export { errorHandler };
 export const errorMiddleware = errorHandler.getErrorMiddleware();
+
+export function handle404(req, res) {
+    res.status(404).json({ error: "Route not found" });
+}
+
+export function handleError(err, req, res, next) {
+    if (!appConfig.isProduction) console.error(err);
+    res.status(err.status || 500).json({
+        error: appConfig.isProduction ? "Internal server error" : err.message,
+    });
+}
