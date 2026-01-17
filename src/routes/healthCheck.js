@@ -2,7 +2,7 @@ import express from "express";
 import os from "node:os";
 import { errorHandler } from "../middleware/errorHandler.js";
 import lockManager from "../utils/lockManager.js";
-import dbManager from "../utils/dbManager.js";
+import db from "../config/db.js";
 import {
     getServiceMetrics,
     checkGeminiApiStatus,
@@ -53,7 +53,7 @@ const getSystemInfo = () => ({
 
 const getDatabaseStatus = () => {
     try {
-        return dbManager.getConnectionStatus();
+        return db.getStatus();
     } catch (err) {
         return { status: "error", message: err.message };
     }

@@ -1,4 +1,3 @@
-import mongoose from "mongoose";
 import Chat from "../models/Chat.js";
 import { v4 as uuidv4 } from "uuid";
 import { encryptText, decryptText } from "../utils/encryption.js";
@@ -10,7 +9,7 @@ import {
   prioritizeQuery,
 } from "../services/aiService.js";
 import lockManager from "../utils/lockManager.js";
-import dbConnection from "../config/dbConnection.js";
+import db from "../config/db.js";
 import LRUCache from "../utils/lruCache.js";
 
 const chatCache = new LRUCache({ maxSize: 100, ttlMs: 15 * 60 * 1000 });
@@ -77,11 +76,9 @@ const decryptMessages = (messages) => {
 const executeDbOperation = async (operation, retries = 2) => {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      if (mongoose.connection.readyState !== 1) {
-        console.warn(
-          `DB not ready (state: ${mongoose.connection.readyState}), attempting reconnect...`
-        );
-        await dbConnection.connect();
+      if (!db.isReady()) {
+        console.warn("[DB] Database not ready, attempting to ensure connection...");
+        await db.ensureConnection();
       }
 
       return await operation();
@@ -410,7 +407,7 @@ export async function getServiceStatus(req, res) {
   try {
     const [metrics, dbStatus, dbStats] = await Promise.all([
       getServiceMetrics(),
-      dbConnection.getConnectionStatus(),
+      db.getStatus(),
       executeDbOperation(async () => {
         const [chatCount, avgSize, recentActivity] = await Promise.all([
           Chat.countDocuments(),

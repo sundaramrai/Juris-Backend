@@ -5,7 +5,7 @@ import express from "express";
 import { validateEnvVars } from "./utils/validation.js";
 import { setupMiddleware } from "./middleware/setupMiddleware.js";
 import { handle404, handleError } from "./middleware/errorHandler.js";
-import { initializeDatabase } from "./utils/database.js";
+import db from "./config/db.js";
 import { startServer } from "./utils/serverLifecycle.js";
 import { appConfig } from "./config/app.js";
 import routes from "./routes/index.js";
@@ -21,7 +21,7 @@ app.use(handle404);
 app.use(handleError);
 
 
-await initializeDatabase();
+await db.connect();
 
 if (!appConfig.isVercel) {
   startServer(app, appConfig.port);
