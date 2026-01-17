@@ -1,125 +1,81 @@
 class LRUCache {
     constructor(options = {}) {
         this.cache = new Map();
-        this.config = {
-            maxSize: options.maxSize || 100,
-            ttlMs: options.ttlMs || 15 * 60 * 1000,
-            maxMemoryMB: options.maxMemoryMB || 100,
-        };
-
-        this.metrics = {
-            hits: 0,
-            misses: 0,
-            evictions: 0,
-            estimatedMemoryBytes: 0,
-        };
+        this.maxSize = options.maxSize || 100;
+        this.ttlMs = options.ttlMs || 15 * 60 * 1000;
+        this.stats = { hits: 0, misses: 0, evictions: 0 };
+        this.accessOrder = [];
     }
 
     get(key) {
-        const now = Date.now();
-        const item = this.cache.get(key);
-
-        if (!item || item.expiry < now) {
-            if (item) this._removeItem(key);
-            this.metrics.misses++;
+        if (!this.cache.has(key)) {
+            this.stats.misses++;
             return undefined;
         }
 
-        this.cache.delete(key);
-        this.cache.set(key, item);
-        this.metrics.hits++;
-        return item.value;
+        const entry = this.cache.get(key);
+        if (Date.now() - entry.timestamp > this.ttlMs) {
+            this.delete(key);
+            this.stats.misses++;
+            return undefined;
+        }
+
+        this._updateAccess(key);
+        this.stats.hits++;
+        return entry.value;
     }
 
     set(key, value) {
-        const now = Date.now();
-        const itemSize = this._estimateSize(value);
-        while (
-            this.metrics.estimatedMemoryBytes + itemSize >
-            this.config.maxMemoryMB * 1024 * 1024 &&
-            this.cache.size > 0
-        ) {
-            this._evictOldest();
+        if (this.cache.size >= this.maxSize && !this.cache.has(key)) {
+            this._evict();
         }
 
-        const existingItem = this.cache.get(key);
-        if (existingItem) {
-            this.metrics.estimatedMemoryBytes -= existingItem.size;
-        }
-
-        this.cache.set(key, {
-            value,
-            expiry: now + this.config.ttlMs,
-            size: itemSize,
-        });
-
-        this.metrics.estimatedMemoryBytes += itemSize;
-
-        if (this.cache.size > this.config.maxSize) {
-            this._evictOldest();
-        }
+        this._updateAccess(key);
+        this.cache.set(key, { value, timestamp: Date.now() });
+        return this;
     }
 
     delete(key) {
-        return this._removeItem(key);
-    }
-
-    invalidatePrefix(prefix) {
-        const keysToDelete = Array.from(this.cache.keys()).filter((key) =>
-            key.startsWith(prefix)
-        );
-        for (const key of keysToDelete) {
-            this.delete(key);
-        }
-    }
-
-    clear() {
-        this.cache.clear();
-        this.metrics.estimatedMemoryBytes = 0;
-    }
-
-    getStats() {
-        const totalRequests = this.metrics.hits + this.metrics.misses;
-        const hitRate = totalRequests > 0 ? this.metrics.hits / totalRequests : 0;
-
-        return {
-            size: this.cache.size,
-            maxSize: this.config.maxSize,
-            hits: this.metrics.hits,
-            misses: this.metrics.misses,
-            evictions: this.metrics.evictions,
-            hitRate: (hitRate * 100).toFixed(2) + "%",
-            memoryUsageMB: (
-                this.metrics.estimatedMemoryBytes /
-                (1024 * 1024)
-            ).toFixed(2),
-            maxMemoryMB: this.config.maxMemoryMB,
-        };
-    }
-
-    _removeItem(key) {
-        const item = this.cache.get(key);
-        if (item) {
-            this.metrics.estimatedMemoryBytes -= item.size;
-            this.cache.delete(key);
+        if (this.cache.delete(key)) {
+            const idx = this.accessOrder.indexOf(key);
+            if (idx > -1) this.accessOrder.splice(idx, 1);
             return true;
         }
         return false;
     }
 
-    _evictOldest() {
-        const oldestKey = this.cache.keys().next().value;
-        if (oldestKey) {
-            this._removeItem(oldestKey);
-            this.metrics.evictions++;
-        }
+    invalidatePrefix(prefix) {
+        const keys = Array.from(this.cache.keys()).filter(k => k.startsWith(prefix));
+        keys.forEach(k => this.delete(k));
     }
 
-    _estimateSize(obj) {
-        try {
-            return JSON.stringify(obj).length * 2;
-        } catch {
-            return 1024;
+    clear() {
+        this.cache.clear();
+        this.accessOrder = [];
+        this.stats = { hits: 0, misses: 0, evictions: 0 };
+    }
+
+    getStats() {
+        const total = this.stats.hits + this.stats.misses;
+        return {
+            size: this.cache.size,
+            maxSize: this.maxSize,
+            hitRate: total > 0 ? ((this.stats.hits / total) * 100).toFixed(2) + "%" : "0%",
+            ...this.stats
+        };
+    }
+
+    _updateAccess(key) {
+        const idx = this.accessOrder.indexOf(key);
+        if (idx > -1) this.accessOrder.splice(idx, 1);
+        this.accessOrder.push(key);
+    }
+
+    _evict() {
+        const key = this.accessOrder.shift();
+        if (key) {
+            this.cache.delete(key);
+            this.stats.evictions++;
         }
     }
 }
