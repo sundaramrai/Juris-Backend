@@ -42,8 +42,29 @@ class DatabaseManager {
         if (mongoose.connection.readyState) await mongoose.disconnect();
     }
 
+    async ensureConnection() {
+        if (this.isReady()) return mongoose.connection;
+        return this.connect(this.#uri);
+    }
+
     isReady() {
         return mongoose.connection.readyState === 1;
+    }
+
+    getStatus() {
+        const states = {
+            0: "disconnected",
+            1: "connected",
+            2: "connecting",
+            3: "disconnecting",
+        };
+
+        return {
+            state: states[mongoose.connection.readyState] || "unknown",
+            readyState: mongoose.connection.readyState,
+            host: mongoose.connection.host,
+            name: mongoose.connection.name,
+        };
     }
 
     #init() {
