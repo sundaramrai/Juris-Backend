@@ -375,30 +375,6 @@ export async function updateChatTitle(req, res) {
   }
 }
 
-export async function deleteChat(req, res) {
-  try {
-    const userId = req.user.userId;
-    const { chatId } = req.params;
-
-    if (!chatId) {
-      return res.status(400).json({ message: "Chat ID is required" });
-    }
-
-    const result = await executeDbOperation(() =>
-      Chat.findOneAndDelete({ userId, chatId })
-    );
-
-    if (!result) {
-      return res.status(404).json({ message: "Chat not found" });
-    }
-
-    chatCache.delete(getCacheKey(userId, chatId));
-    res.json({ message: "Chat deleted successfully", chatId });
-  } catch (error) {
-    return handleError(res, error, "Error deleting chat");
-  }
-}
-
 export async function getServiceStatus(req, res) {
   if (!req.user.isAdmin) {
     return res.status(403).json({ message: "Unauthorized" });
