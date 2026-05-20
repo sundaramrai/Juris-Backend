@@ -44,10 +44,22 @@ function decryptText(encryptedText) {
 }
 
 function hashUsername(username) {
+  return hashNormalizedValue(username, process.env.USERNAME_HASH_SALT);
+}
+
+function hashEmail(email) {
+  return hashNormalizedValue(email, process.env.EMAIL_HASH_SALT || process.env.USERNAME_HASH_SALT);
+}
+
+function hashNormalizedValue(value, salt) {
+  if (!salt) {
+    throw new Error("Hash salt environment variable is not defined");
+  }
+
   return crypto
-    .createHmac("sha256", process.env.USERNAME_HASH_SALT)
-    .update(username.toLowerCase().trim())
+    .createHmac("sha256", salt)
+    .update(String(value).toLowerCase().trim())
     .digest("hex");
 }
 
-export { encryptText, decryptText, hashUsername };
+export { encryptText, decryptText, hashEmail, hashUsername };
