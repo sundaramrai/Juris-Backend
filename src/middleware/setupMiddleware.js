@@ -1,6 +1,5 @@
 import cors from "cors";
 import compression from "compression";
-import compressible from "compressible";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import mongoSanitize from "express-mongo-sanitize";
@@ -54,11 +53,7 @@ const createCompressionMiddleware = () =>
     compression({
         filter: (req, res) => {
             if (req.headers["x-no-compression"]) return false;
-            const contentType =
-                typeof res.getHeader === "function"
-                    ? res.getHeader("Content-Type")
-                    : undefined;
-            return compressible(contentType);
+            return compression.filter(req, res);
         },
         level: 6,
     });
