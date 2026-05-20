@@ -17,11 +17,9 @@ const CONFIG = {
     RETRY_DELAY: 1000,
     TIMEOUT: 15000,
     MAX_CONCURRENT: 10,
-    BATCH_SIZE: 5,
   },
   HEALTH: {
     CHECK_INTERVAL: 30000,
-    MAX_CONSECUTIVE_ERRORS: 3,
   },
 };
 
@@ -535,12 +533,6 @@ const health = {
     lastCheck: Date.now(),
     consecutiveFailures: 0,
   },
-  connection: {
-    lastSuccessful: Date.now(),
-    consecutiveErrors: 0,
-    isStable: true,
-    errorTypes: {},
-  },
 };
 
 const semaphore = new Semaphore(CONFIG.REQUEST.MAX_CONCURRENT);
@@ -629,7 +621,7 @@ const Utils = {
           "\n\n**Related Resources**:\n" +
           resources
             .slice(0, 3)
-            .map((r) => `• ${r}`)
+            .map((resource) => `- ${resource}`)
             .join("\n");
       }
     }
@@ -997,32 +989,6 @@ const HealthMonitor = {
     }
   },
 
-  async checkConnection() {
-    try {
-      await fetch("https://generativelanguage.googleapis.com/v1/models", {
-        method: "GET",
-        signal: AbortSignal.timeout(5000),
-      });
-
-      health.connection.lastSuccessful = Date.now();
-      health.connection.consecutiveErrors = 0;
-      health.connection.isStable = true;
-      return true;
-    } catch (error) {
-      health.connection.consecutiveErrors++;
-      const errorType = error.code || "UNKNOWN";
-      health.connection.errorTypes[errorType] =
-        (health.connection.errorTypes[errorType] || 0) + 1;
-
-      if (
-        health.connection.consecutiveErrors >=
-        CONFIG.HEALTH.MAX_CONSECUTIVE_ERRORS
-      ) {
-        health.connection.isStable = false;
-      }
-      return false;
-    }
-  },
 };
 
 async function processQuery(query) {
@@ -1041,7 +1007,7 @@ async function processQuery(query) {
 
     const basicClassification = Classifier.basic(query);
 
-    if (!health.connection.isStable || !health.api.isAvailable) {
+    if (!health.api.isAvailable) {
       if (
         basicClassification.category === "general_chat" ||
         !basicClassification.isLegal
@@ -1075,11 +1041,6 @@ async function processQuery(query) {
     } else {
       const handler = ResponseGenerator[classification.category];
       response = handler ? handler(query) : ResponseGenerator.chat(query);
-    }
-
-    if (health.connection.consecutiveErrors > 0) {
-      health.connection.consecutiveErrors = 0;
-      health.connection.isStable = true;
     }
 
     return { response, classification };
@@ -1145,50 +1106,6 @@ async function generateChatTitle(query, classification) {
   return query.substring(0, 47) + "...";
 }
 
-async function batchProcessQueries(queries) {
-  if (!queries?.length) return [];
-
-  const prioritized = queries.map((query) => ({
-    query,
-    priority: determinePriority(query),
-  }));
-
-  prioritized.sort((a, b) => {
-    const order = { high: 0, medium: 1, normal: 2 };
-    return order[a.priority] - order[b.priority];
-  });
-
-  const results = [];
-  let currentBatch = [];
-
-  for (const { query, priority } of prioritized) {
-    if (priority === "high" && currentBatch.length > 0) {
-      results.push(
-        ...(await Promise.all(currentBatch.map((q) => processQuery(q))))
-      );
-      currentBatch = [];
-    }
-
-    currentBatch.push(query);
-    const limit = priority === "high" ? 2 : CONFIG.REQUEST.BATCH_SIZE;
-
-    if (currentBatch.length >= limit) {
-      results.push(
-        ...(await Promise.all(currentBatch.map((q) => processQuery(q))))
-      );
-      currentBatch = [];
-    }
-  }
-
-  if (currentBatch.length > 0) {
-    results.push(
-      ...(await Promise.all(currentBatch.map((q) => processQuery(q))))
-    );
-  }
-
-  return results;
-}
-
 function determinePriority(query) {
   if (Utils.matchKeywords(query, KEYWORDS.emergency) > 0) {
     return "high";
@@ -1245,10 +1162,6 @@ function getServiceMetrics() {
         lastCheck: health.api.lastCheck,
         consecutiveFailures: health.api.consecutiveFailures,
       },
-      connection: {
-        ...health.connection,
-        timeSinceLastSuccess: now - health.connection.lastSuccessful,
-      },
     },
     system: {
       memory: process.memoryUsage(),
@@ -1257,87 +1170,15 @@ function getServiceMetrics() {
   };
 }
 
-function isLegalQuery(query) {
-  return Classifier.basic(query).isLegal;
-}
-
-const classifyQuery = Classifier.basic;
-const classifyQueryDynamic = Classifier.withAI;
-const categorizeIndianLegalQuery = Classifier.categorize;
-const generateGeminiResponse = ResponseGenerator.legal;
-
-function handleNonLegalQuery(query, classification) {
-  const handler = ResponseGenerator[classification.category];
-  return handler ? handler(query) : ResponseGenerator.chat(query);
-}
-
-function generateIndianLegalResources(category) {
-  return LEGAL_RESOURCES[category] || LEGAL_RESOURCES.general;
-}
-
-const formatIndianLegalResponse = Utils.formatResponse;
-
-function containsIndianLanguage(query) {
-  return REGEX.INDIAN_LANGUAGE.test(query);
-}
-
-const simplifyLegalTerms = Utils.simplifyLegalTerms;
-
-function isEmergencyLegalQuery(query) {
-  return Utils.matchKeywords(query, KEYWORDS.emergency) > 0;
-}
-
-function getEmergencyLegalResources() {
-  return {
-    police: "100",
-    women_helpline: "1091",
-    child_helpline: "1098",
-    senior_citizen_helpline: "14567",
-    nalsa: "1516",
-    domestic_violence: "181",
-  };
-}
-
 const checkGeminiApiStatus = HealthMonitor.checkAPI;
-const checkConnectionHealth = HealthMonitor.checkConnection;
-
-function getUnavailableServiceResponse() {
-  return {
-    response:
-      "Our AI service is temporarily unavailable. We're working to restore service. Please try again later.",
-    classification: {
-      isLegal: false,
-      category: "service_unavailable",
-      confidence: 1,
-    },
-  };
-}
-
 const withRetry = RetryHandler.execute;
 const prioritizeQuery = determinePriority;
-const adjustThrottling = () => { };
 
 export {
   processQuery,
   generateChatTitle,
-  batchProcessQueries,
-  isLegalQuery,
-  classifyQuery,
-  classifyQueryDynamic,
-  categorizeIndianLegalQuery,
-  generateGeminiResponse,
-  handleNonLegalQuery,
-  generateIndianLegalResources,
-  formatIndianLegalResponse,
-  containsIndianLanguage,
-  simplifyLegalTerms,
-  isEmergencyLegalQuery,
-  getEmergencyLegalResources,
   checkGeminiApiStatus,
-  checkConnectionHealth,
   getServiceMetrics,
-  getUnavailableServiceResponse,
   withRetry,
   prioritizeQuery,
-  adjustThrottling,
 };
