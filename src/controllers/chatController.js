@@ -135,7 +135,7 @@ export async function processChat(req, res) {
     }
 
     const priority =
-      message.length < 200 ? await prioritizeQuery(message) : "normal";
+      message.length < 200 ? prioritizeQuery(message) : "normal";
     const processingStart = Date.now();
 
     const { response: botResponse, classification } = await withRetry(
@@ -382,7 +382,7 @@ export async function getServiceStatus(req, res) {
 
   try {
     const [metrics, dbStatus, dbStats] = await Promise.all([
-      getServiceMetrics(),
+      Promise.resolve(getServiceMetrics()),
       db.getStatus(),
       executeDbOperation(async () => {
         const [chatCount, avgSize, recentActivity] = await Promise.all([
