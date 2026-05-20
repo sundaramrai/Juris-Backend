@@ -1,7 +1,7 @@
 import User from "../models/User.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import { encryptText, decryptText, hashUsername } from "../utils/encryption.js";
+import { encryptText, decryptText, hashEmail, hashUsername } from "../utils/encryption.js";
 
 function sendError(res, status, message, error = null) {
   const payload = { message };
@@ -9,18 +9,27 @@ function sendError(res, status, message, error = null) {
   return res.status(status).json(payload);
 }
 
-async function findExistingUser(email, usernameHash) {
-  return await User.findOne({ $or: [{ email }, { usernameHash }] });
+async function findExistingUser(emailHash, usernameHash) {
+  return await User.findOne({ $or: [{ emailHash }, { usernameHash }] });
+}
+
+function serializeUser(user) {
+  return {
+    id: user._id,
+    username: decryptText(user.username),
+    email: decryptText(user.email),
+  };
 }
 
 export async function register(req, res) {
   try {
     const { email, username, password } = req.body;
+    const emailHash = hashEmail(email);
     const usernameHash = hashUsername(username);
 
-    const existingUser = await findExistingUser(email, usernameHash);
+    const existingUser = await findExistingUser(emailHash, usernameHash);
     if (existingUser) {
-      if (existingUser.email === email) {
+      if (existingUser.emailHash === emailHash) {
         return sendError(
           res,
           400,
@@ -40,6 +49,7 @@ export async function register(req, res) {
 
     const user = new User({
       email: encryptedEmail,
+      emailHash,
       username: encryptedUsername,
       usernameHash,
       password: hashedPassword,
@@ -74,20 +84,16 @@ export async function login(req, res) {
       return sendError(res, 401, "Incorrect password. Please try again.");
     }
 
+    const serializedUser = serializeUser(user);
     const token = jwt.sign(
-      { userId: user._id, username: decryptText(user.username) },
+      { userId: user._id, username: serializedUser.username },
       process.env.JWT_SECRET,
       { expiresIn: "12h" }
     );
-    const decryptedEmail = decryptText(user.email);
 
     res.json({
       token,
-      user: {
-        username: decryptText(user.username),
-        email: decryptedEmail,
-        id: user._id,
-      },
+      user: serializedUser,
     });
   } catch (error) {
     console.error("Login Error:", error);
@@ -129,7 +135,7 @@ export async function getUser(req, res) {
     const user = await User.findById(req.user.userId).select("-password");
     if (!user)
       return sendError(res, 404, "User not found. Please log in again.");
-    res.json(user);
+    res.json(serializeUser(user));
   } catch (error) {
     console.error("Error fetching user:", error);
     sendError(
