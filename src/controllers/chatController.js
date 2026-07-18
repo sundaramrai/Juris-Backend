@@ -5,7 +5,6 @@ import {
   generateChatTitle,
   processQuery,
   getServiceMetrics,
-  withRetry,
   prioritizeQuery,
 } from "../services/aiService.js";
 import lockManager from "../utils/lockManager.js";
@@ -138,12 +137,7 @@ export async function processChat(req, res) {
       message.length < 200 ? prioritizeQuery(message) : "normal";
     const processingStart = Date.now();
 
-    const { response: botResponse, classification } = await withRetry(
-      () => processQuery(message),
-      3,
-      1000,
-      true
-    );
+    const { response: botResponse, classification } = await processQuery(message);
 
     const processingTime = Date.now() - processingStart;
     const timestamp = new Date();
