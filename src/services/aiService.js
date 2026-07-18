@@ -856,8 +856,9 @@ const ResponseGenerator = {
     return "I specialize in legal information. For government service details, visit the National Government Services Portal (https://services.india.gov.in). What legal aspect can I help clarify?";
   },
 
-  legalFallback: (query, classification = {}) => {
+  legalFallback: (query, classification = {}, realtimeResults = null) => {
     const category = classification.subCategory || "general";
+    const hasRealtimeData = Boolean(realtimeResults?.length);
 
     return Utils.formatResponse(
       [
@@ -866,10 +867,13 @@ const ResponseGenerator = {
         `Your query appears related to ${category.replaceAll("_", " ")} law in India.`,
         "",
         "For recent changes in Indian law, check the official Gazette of India, relevant ministry notifications, and recent Supreme Court or High Court judgments. If your question is about a specific Act, amendment, court decision, or legal area, ask with that detail and I can narrow the explanation.",
+        hasRealtimeData
+          ? `\nRecent sources:\n${formatSearchResults(realtimeResults, { maxResults: 5 })}`
+          : "",
       ].join("\n"),
       category,
       classification.sentiment,
-      false
+      hasRealtimeData
     );
   },
 
@@ -960,9 +964,11 @@ const ResponseGenerator = {
       return p;
     };
 
+    let realtimeResults = null;
+
     try {
       const mainPrompt = buildMainPrompt();
-      const realtimeResults = await fetchRealtimeResults();
+      realtimeResults = await fetchRealtimeResults();
 
       const text = await RetryHandler.execute(
         () => generateAIText(mainPrompt, { maxTokens: 1200 }),
@@ -993,7 +999,7 @@ const ResponseGenerator = {
     } catch (error) {
       console.error("AI response error:", error);
       metrics.aiErrors++;
-      return ResponseGenerator.legalFallback(prompt, classification);
+      return ResponseGenerator.legalFallback(prompt, classification, realtimeResults);
     }
   },
 };
