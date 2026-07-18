@@ -41,9 +41,8 @@ const chatSchema = new mongoose.Schema({
   },
 });
 
-chatSchema.pre("save", function (next) {
+chatSchema.pre("save", function () {
   this.updatedAt = new Date();
-  next();
 });
 
 export default mongoose.model("Chat", chatSchema);
