@@ -5,7 +5,7 @@ import lockManager from "../utils/lockManager.js";
 import db from "../config/db.js";
 import {
     getServiceMetrics,
-    checkGeminiApiStatus,
+    checkAIProviderStatus,
 } from "../services/aiService.js";
 
 const router = express.Router();
@@ -64,7 +64,7 @@ const getCompleteSystemInfo = async () => {
     if (systemInfoCache && now - systemInfoCacheTime < CACHE_TTL)
         return systemInfoCache;
 
-    const aiStatus = await checkGeminiApiStatus();
+    const aiStatus = await checkAIProviderStatus();
     const systemInfo = {
         ...getBasicSystemInfo(),
         memory: getMemoryInfo(),
