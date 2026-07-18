@@ -2,7 +2,7 @@ function validateEnvVars() {
   const requiredEnvVars = [
     "MONGO_URI",
     "JWT_SECRET",
-    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
     "ENCRYPTION_KEY",
     "USERNAME_HASH_SALT",
     "GOOGLE_SEARCH_ENGINE_ID",
