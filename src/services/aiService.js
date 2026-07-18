@@ -1,4 +1,4 @@
-import { model } from "../config/ai.js";
+import { generateAIText } from "../config/ai.js";
 import {
   getRecentLegalUpdates,
   formatSearchResults,
@@ -531,11 +531,35 @@ const health = {
   api: {
     isAvailable: true,
     lastCheck: Date.now(),
+    retryAfter: 0,
     consecutiveFailures: 0,
   },
 };
 
 const semaphore = new Semaphore(CONFIG.REQUEST.MAX_CONCURRENT);
+
+const getRetryDelayMs = (error) => {
+  const retryDelay = error.errorDetails?.find(
+    (detail) => detail["@type"] === "type.googleapis.com/google.rpc.RetryInfo"
+  )?.retryDelay;
+
+  const seconds = Number.parseFloat(retryDelay);
+  return Number.isFinite(seconds) ? seconds * 1000 : CONFIG.HEALTH.CHECK_INTERVAL;
+};
+
+const isQuotaError = (error) =>
+  error?.status === 429 ||
+  error?.statusText === "Too Many Requests" ||
+  /quota|too many requests|rate limit/i.test(error?.message || "");
+
+const markApiUnavailable = (error) => {
+  const now = Date.now();
+  health.api.isAvailable = false;
+  health.api.consecutiveFailures++;
+  health.api.lastCheck = now;
+  health.api.retryAfter =
+    now + (isQuotaError(error) ? getRetryDelayMs(error) : CONFIG.HEALTH.CHECK_INTERVAL);
+};
 
 const Utils = {
   normalizeQuery: (query) => query.toLowerCase().trim(),
@@ -707,15 +731,10 @@ Format:
 
     try {
       metrics.aiCalls++;
-      const result = await RetryHandler.execute(
-        () => model.generateContent(prompt),
+      let text = await RetryHandler.execute(
+        () => generateAIText(prompt, { maxTokens: 600 }),
         2
       );
-
-      let text =
-        result.response?.text?.() ||
-        result.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
-        result.text?.();
 
       text = text.trim().replaceAll(/```json\n?|\n?```/g, "");
 
@@ -773,8 +792,13 @@ const RetryHandler = {
           lastError = error;
           metrics.retries++;
 
-          if (error.message.includes("Timeout")) {
+          if ((error?.message || "").includes("Timeout")) {
             metrics.timeouts++;
+          }
+
+          if (isQuotaError(error)) {
+            markApiUnavailable(error);
+            break;
           }
 
           if (attempt < maxRetries) {
@@ -830,6 +854,23 @@ const ResponseGenerator = {
 
   relatedServices: () => {
     return "I specialize in legal information. For government service details, visit the National Government Services Portal (https://services.india.gov.in). What legal aspect can I help clarify?";
+  },
+
+  legalFallback: (query, classification = {}) => {
+    const category = classification.subCategory || "general";
+
+    return Utils.formatResponse(
+      [
+        "I could not generate a detailed AI answer right now, but I can still help with the legal direction.",
+        "",
+        `Your query appears related to ${category.replaceAll("_", " ")} law in India.`,
+        "",
+        "For recent changes in Indian law, check the official Gazette of India, relevant ministry notifications, and recent Supreme Court or High Court judgments. If your question is about a specific Act, amendment, court decision, or legal area, ask with that detail and I can narrow the explanation.",
+      ].join("\n"),
+      category,
+      classification.sentiment,
+      false
+    );
   },
 
   async legal(prompt, classification) {
@@ -923,14 +964,10 @@ const ResponseGenerator = {
       const mainPrompt = buildMainPrompt();
       const realtimeResults = await fetchRealtimeResults();
 
-      const result = await RetryHandler.execute(
-        () => model.generateContent(mainPrompt),
+      const text = await RetryHandler.execute(
+        () => generateAIText(mainPrompt, { maxTokens: 1200 }),
         2
       );
-      let text =
-        result.response?.text?.() ||
-        result.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
-        result.text?.();
 
       const responseTime = Date.now() - startTime;
       metrics.totalResponseTime += responseTime;
@@ -956,7 +993,7 @@ const ResponseGenerator = {
     } catch (error) {
       console.error("AI response error:", error);
       metrics.aiErrors++;
-      return "I'm experiencing difficulty answering your legal question. Please try rephrasing or ask about a specific aspect.";
+      return ResponseGenerator.legalFallback(prompt, classification);
     }
   },
 };
@@ -966,21 +1003,20 @@ const HealthMonitor = {
     const now = Date.now();
     if (
       !health.api.isAvailable &&
-      now - health.api.lastCheck < CONFIG.HEALTH.CHECK_INTERVAL
+      now < health.api.retryAfter
     ) {
       return false;
     }
 
     try {
-      await model.generateContent("Hello");
+      await generateAIText("Hello", { maxTokens: 20 });
       health.api.isAvailable = true;
       health.api.consecutiveFailures = 0;
       health.api.lastCheck = now;
+      health.api.retryAfter = 0;
       return true;
     } catch (error) {
-      health.api.isAvailable = false;
-      health.api.consecutiveFailures++;
-      health.api.lastCheck = now;
+      markApiUnavailable(error);
       console.error(
         `API unavailable (failure #${health.api.consecutiveFailures})`,
         error
@@ -1032,6 +1068,28 @@ async function processQuery(query) {
     }
 
     const classification = await Classifier.withAI(query);
+
+    if (!health.api.isAvailable) {
+      if (classification.category === "general_chat" || !classification.isLegal) {
+        return {
+          response:
+            ResponseGenerator[classification.category]?.(query) ||
+            ResponseGenerator.chat(query),
+          classification,
+          fromCache: true,
+        };
+      }
+
+      return {
+        response:
+          "Our AI service is temporarily unavailable because the AI provider quota has been reached. Please try again after the quota resets.",
+        classification: {
+          ...classification,
+          category: "service_unavailable",
+          confidence: 1,
+        },
+      };
+    }
 
     let response;
     if (classification.isLegal) {
@@ -1160,6 +1218,7 @@ function getServiceMetrics() {
       api: {
         available: health.api.isAvailable,
         lastCheck: health.api.lastCheck,
+        retryAfter: health.api.retryAfter,
         consecutiveFailures: health.api.consecutiveFailures,
       },
     },
@@ -1170,15 +1229,13 @@ function getServiceMetrics() {
   };
 }
 
-const checkGeminiApiStatus = HealthMonitor.checkAPI;
-const withRetry = RetryHandler.execute;
+const checkAIProviderStatus = HealthMonitor.checkAPI;
 const prioritizeQuery = determinePriority;
 
 export {
   processQuery,
   generateChatTitle,
-  checkGeminiApiStatus,
+  checkAIProviderStatus,
   getServiceMetrics,
-  withRetry,
   prioritizeQuery,
 };
