@@ -908,6 +908,32 @@ const ResponseGenerator = {
       return main;
     };
 
+    const extractSpecificTopic = (inputPrompt) => {
+      const topicPrefixes = [
+        'tell me about',
+        'what is',
+        'explain',
+        'concerning',
+        'regarding',
+        'about',
+      ];
+      const lowerPrompt = inputPrompt.toLowerCase();
+
+      for (const prefix of topicPrefixes) {
+        const prefixIndex = lowerPrompt.indexOf(prefix);
+        if (prefixIndex === -1) continue;
+
+        const startIndex = prefixIndex + prefix.length;
+        let endIndex = inputPrompt.indexOf('?', startIndex);
+        if (endIndex === -1) endIndex = inputPrompt.length;
+
+        const candidate = inputPrompt.slice(startIndex, endIndex).trim();
+        if (candidate) return candidate;
+      }
+
+      return null;
+    };
+
     const fetchRealtimeResults = async () => {
       if (!classification.isLegal) return null;
 
@@ -922,11 +948,8 @@ const ResponseGenerator = {
       }
 
       if (isSpecificTopicQuery) {
-        const topicMatch = prompt.match(
-          /(?:about|regarding|concerning|explain|what is|tell me about)\s+(.+?)(?:\?|$)/i
-        );
-        if (!topicMatch) return null;
-        const topic = topicMatch[1].trim();
+        const topic = extractSpecificTopic(prompt);
+        if (!topic) return null;
         const results = await searchSpecificTopic(topic, {
           deepSearch: true,
           includeRelated: true,
